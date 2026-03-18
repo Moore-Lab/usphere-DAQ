@@ -73,13 +73,13 @@ CONFIG_FIELDS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 CONTROL_NAMES: list[str] = [
-    "Dg X",         # Derivative gain,    X axis
-    "Ig X",         # Integral gain,       X axis
-    "Dg Y",         # Derivative gain,     Y axis
-    "Ig Y",         # Integral gain,       Y axis
-    "Pg Z",         # Proportional gain,   Z axis
-    "Ig Z",         # Integral gain,       Z axis
-    "Dg Z",         # Derivative gain,     Z axis
+    "dg X",         # Derivative gain,     X axis
+    " ig X",        # Integral gain,       X axis
+    "dg Y",         # Derivative gain,     Y axis
+    " ig Y",        # Integral gain,       Y axis
+    "pg Z",         # Proportional gain,   Z axis
+    " ig Z",        # Integral gain,       Z axis
+    "dg Z",         # Derivative gain,     Z axis
     "DC offset X",  # DC offset,           X axis
     "DC offset Y",  # DC offset,           Y axis
     "DC offset Z",  # DC offset,           Z axis

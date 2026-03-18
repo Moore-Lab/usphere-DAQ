@@ -17,10 +17,9 @@ from __future__ import annotations
 import datetime
 import json
 import sys
-import threading
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication,
@@ -168,26 +167,35 @@ class ModulesWidget(QWidget):
             edit.setText(path)
 
     def _run_test(self, mod):
-        """Run mod.test() in a worker thread; update the status label when done."""
+        """Run mod.test() in a QThread; update the status label via signal."""
         config = self.get_module_config(mod.MODULE_NAME)
         lbl = self._status_labels[mod.MODULE_NAME]
         lbl.setText("Testing…")
         lbl.setStyleSheet("color: gray;")
 
-        def _worker():
-            ok, msg = mod.test(config)
-            # Qt widgets must be updated from the main thread — use a one-shot
-            # connection via a local QObject signal trick isn't available here,
-            # so we use a simple lambda posted via QApplication.instance().
-            from PyQt5.QtCore import QMetaObject, Qt as _Qt
-            def _update():
-                lbl.setText(msg)
-                lbl.setStyleSheet("color: green;" if ok else "color: red;")
-            # postEvent approach: schedule on the main thread
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(0, _update)
+        class _Worker(QThread):
+            done = pyqtSignal(bool, str)
 
-        threading.Thread(target=_worker, daemon=True).start()
+            def __init__(self, mod, config):
+                super().__init__()
+                self._mod = mod
+                self._config = config
+
+            def run(self):
+                ok, msg = self._mod.test(self._config)
+                self.done.emit(ok, msg)
+
+        worker = _Worker(mod, config)
+        worker.done.connect(lambda ok, msg, l=lbl: (
+            l.setText(msg),
+            l.setStyleSheet("color: green;" if ok else "color: red;"),
+        ))
+        worker.finished.connect(worker.deleteLater)
+        # Keep a reference so the thread isn't garbage-collected mid-run
+        self._active_tests = getattr(self, "_active_tests", [])
+        self._active_tests.append(worker)
+        worker.done.connect(lambda _ok, _msg, w=worker: self._active_tests.remove(w))
+        worker.start()
 
     # ------------------------------------------------------------------
     # Config access (called by MainWindow)
