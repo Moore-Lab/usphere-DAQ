@@ -35,12 +35,14 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from daq_core import ALL_CHANNELS, DAQConfig, DAQRecorder
+from daq_plot import PlotWidget
 
 # Rolling session log — sits alongside this script
 LOG_FILE = Path(__file__).parent / "daq_session_log.jsonl"
@@ -113,17 +115,29 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         vbox = QVBoxLayout(root)
-        vbox.setSpacing(8)
-        vbox.setContentsMargins(10, 10, 10, 10)
+        vbox.setSpacing(4)
+        vbox.setContentsMargins(6, 6, 6, 6)
 
-        # Top section: channels (left) | settings (right)
+        tabs = QTabWidget()
+        vbox.addWidget(tabs)
+
+        # --- Tab 1: Acquire ---
+        acquire_w = QWidget()
+        acquire_layout = QVBoxLayout(acquire_w)
+        acquire_layout.setSpacing(8)
+        acquire_layout.setContentsMargins(6, 6, 6, 6)
+
         top = QHBoxLayout()
         top.addWidget(self._make_channels_panel(), stretch=2)
         top.addWidget(self._make_settings_panel(), stretch=3)
-        vbox.addLayout(top, stretch=3)
+        acquire_layout.addLayout(top, stretch=3)
+        acquire_layout.addWidget(self._make_status_panel(), stretch=2)
 
-        # Bottom section: status log + start/stop
-        vbox.addWidget(self._make_status_panel(), stretch=2)
+        tabs.addTab(acquire_w, "Acquire")
+
+        # --- Tab 2: Plot ---
+        self._plot_tab = PlotWidget()
+        tabs.addTab(self._plot_tab, "Plot")
 
     # --- Channel panel ---
 
@@ -393,9 +407,10 @@ class MainWindow(QMainWindow):
     # Recorder callbacks (called from worker thread via signals)
     # ------------------------------------------------------------------
 
-    def _on_file_written(self, _path: str):
+    def _on_file_written(self, path: str):
         self._files_written += 1
         self._files_lbl.setText(f"Files written this session: {self._files_written}")
+        self._plot_tab.load_file(path)  # keep plot tab pointed at the latest file
 
     def _on_recording_finished(self):
         self._apply_btn_style(running=False)

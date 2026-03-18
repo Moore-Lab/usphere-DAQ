@@ -14,3 +14,7 @@ numpy>=1.24.0
 
 # GUI
 PyQt5>=5.15.0
+
+# Plotting
+matplotlib>=3.7.0
+scipy>=1.10.0
