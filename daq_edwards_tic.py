@@ -85,8 +85,8 @@ PARAM_WIDE_RANGE = 913   # Wide-range gauge (WRG),     input 1 — TIC returns P
 # Output keys and defaults
 # ---------------------------------------------------------------------------
 
-KEY_APGX = "APGX pressure (mbar)"
-KEY_WRG  = "WRG pressure (mbar)"
+KEY_APGX = "APGX"
+KEY_WRG  = "WRG"
 
 DEFAULTS: dict = {
     KEY_APGX: 0.0,
