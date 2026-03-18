@@ -120,12 +120,14 @@ def _query(ser, param_id: int) -> float:
     if raw.startswith("*"):
         raise IOError(f"TIC error for parameter {param_id}: {raw!r}")
 
-    # Success response: =Vnnn <value>
+    # Success response: =Vnnn <value>[;<extra fields>...]
+    # The TIC may return semicolon-delimited fields; pressure is always first.
     match = re.match(r"=V\d+\s+([\S]+)", raw)
     if not match:
         raise IOError(f"Unexpected TIC response for parameter {param_id}: {raw!r}")
 
-    return float(match.group(1))
+    first_field = match.group(1).split(";")[0]
+    return float(first_field)
 
 
 # ---------------------------------------------------------------------------
