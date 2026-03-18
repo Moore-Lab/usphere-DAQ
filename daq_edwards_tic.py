@@ -77,20 +77,20 @@ CONFIG_FIELDS: list[dict] = [
 # Verify against your TIC manual if gauge inputs differ from the defaults.
 # ---------------------------------------------------------------------------
 
-PARAM_PIRANI     = 913   # Pirani gauge pressure,      input 1 (mbar)
-PARAM_WIDE_RANGE = 914   # Wide-range gauge pressure,  input 2 (mbar)
+PARAM_PIRANI     = 914   # Pirani gauge (APGX),        input 2 — TIC returns Pa
+PARAM_WIDE_RANGE = 913   # Wide-range gauge (WRG),     input 1 — TIC returns Pa
 
 
 # ---------------------------------------------------------------------------
 # Output keys and defaults
 # ---------------------------------------------------------------------------
 
-KEY_PIRANI     = "Pirani pressure (mbar)"
-KEY_WIDE_RANGE = "Wide range pressure (mbar)"
+KEY_APGX = "APGX pressure (mbar)"
+KEY_WRG  = "WRG pressure (mbar)"
 
 DEFAULTS: dict = {
-    KEY_PIRANI:     0.0,
-    KEY_WIDE_RANGE: 0.0,
+    KEY_APGX: 0.0,
+    KEY_WRG:  0.0,
 }
 
 
@@ -127,7 +127,8 @@ def _query(ser, param_id: int) -> float:
         raise IOError(f"Unexpected TIC response for parameter {param_id}: {raw!r}")
 
     first_field = match.group(1).split(";")[0]
-    return float(first_field)
+    # TIC returns pressure in Pascals; convert to mbar (1 mbar = 100 Pa)
+    return float(first_field) / 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +167,12 @@ def read(config: dict) -> dict:
         stopbits=serial.STOPBITS_ONE,
         timeout=2.0,
     ) as ser:
-        pirani     = _query(ser, PARAM_PIRANI)
-        wide_range = _query(ser, PARAM_WIDE_RANGE)
+        apgx = _query(ser, PARAM_PIRANI)
+        wrg  = _query(ser, PARAM_WIDE_RANGE)
 
     return {
-        KEY_PIRANI:     pirani,
-        KEY_WIDE_RANGE: wide_range,
+        KEY_APGX: apgx,
+        KEY_WRG:  wrg,
     }
 
 
@@ -182,11 +183,11 @@ def test(config: dict) -> tuple[bool, str]:
     """
     try:
         values = read(config)
-        pirani     = values[KEY_PIRANI]
-        wide_range = values[KEY_WIDE_RANGE]
+        apgx = values[KEY_APGX]
+        wrg  = values[KEY_WRG]
         return True, (
-            f"OK — Pirani: {pirani:.3g} mbar  |  "
-            f"Wide range: {wide_range:.3g} mbar"
+            f"OK — APGX: {apgx:.3g} mbar  |  "
+            f"WRG: {wrg:.3g} mbar"
         )
     except KeyError as e:
         return False, f"Missing config field: {e}"
