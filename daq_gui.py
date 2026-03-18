@@ -645,6 +645,14 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Tell Windows this is its own app (not generic Python) so the taskbar
+    # shows our icon instead of the Python launcher icon.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yale.usphere.DAQ")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     icon_path = Path(__file__).parent / "assets" / "Logo_transparent_outlined.PNG"
