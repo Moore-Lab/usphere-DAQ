@@ -21,3 +21,6 @@ scipy>=1.10.0
 
 # FPGA interface (NI FlexRIO / NI-RIO driver required separately from ni.com)
 nifpga>=21.0.0
+
+# Serial communication (Edwards TIC and other RS-232 devices)
+pyserial>=3.5
