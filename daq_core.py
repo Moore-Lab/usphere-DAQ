@@ -23,10 +23,11 @@ try:
 except ImportError:
     NIDAQMX_AVAILABLE = False
 
-# Fixed channel schema — PXIe-6363 has 32 analog input channels.
-# All files always contain a dataset for every channel so column positions
-# never change; unrecorded channels are stored with shape (0,).
-ALL_CHANNELS: list[str] = [f"ai{i}" for i in range(32)]
+# Number of data streams in every output file.
+# Matches the reference file structure: beads/data/pos_data shape (N_STREAMS, n_samples).
+# Change this constant if the channel count changes; the file schema follows automatically.
+N_STREAMS: int = 17
+ALL_CHANNELS: list[str] = [f"ai{i}" for i in range(N_STREAMS)]
 
 
 # ---------------------------------------------------------------------------
@@ -137,38 +138,44 @@ class DAQRecorder:
         return out / f"{self.config.basename}_{index}.h5"
 
     def _write_h5(self, filepath: Path, data: dict[str, np.ndarray]):
-        """Write one HDF5 file with a fixed schema for all 32 channels."""
-        cfg = self.config
-        with h5py.File(filepath, "w") as f:
-            # File-level metadata
-            f.attrs["device"] = cfg.device
-            f.attrs["sample_rate_hz"] = cfg.sample_rate
-            f.attrs["n_samples"] = cfg.n_samples
-            f.attrs["n_bits"] = cfg.n_bits
-            f.attrs["voltage_min_v"] = cfg.voltage_min
-            f.attrs["voltage_max_v"] = cfg.voltage_max
-            f.attrs["active_channels"] = list(cfg.active_channels)
-            f.attrs["start_time_utc"] = datetime.datetime.utcnow().isoformat()
-            f.attrs["duration_s"] = cfg.duration_s
+        """
+        Write one HDF5 file matching the reference structure:
 
-            # One dataset per channel — always at the same location.
-            # Recorded channels: shape (n_samples,), gzip-compressed.
-            # Unrecorded channels: shape (0,) — present but empty.
-            for ch in ALL_CHANNELS:
-                if ch in data:
-                    ds = f.create_dataset(
-                        ch,
-                        data=data[ch],
-                        dtype=np.float64,
-                        compression="gzip",
-                        compression_opts=1,
-                    )
-                    ds.attrs["recorded"] = True
-                else:
-                    ds = f.create_dataset(ch, shape=(0,), dtype=np.float64)
-                    ds.attrs["recorded"] = False
-                ds.attrs["units"] = "V"
-                ds.attrs["channel_index"] = int(ch[2:])
+            beads/data/pos_data   shape (N_STREAMS, n_samples)
+
+        Active channels fill their row; unrecorded streams are left as zeros.
+        All metadata is stored as dataset-level attributes to match the template.
+
+        Note: the reference file uses dtype int16 (raw ADC counts). We store
+        float64 (calibrated volts from nidaqmx) so the schema is structurally
+        identical but values are in physical units. Convert to int16 in
+        post-processing if raw counts are needed.
+        """
+        cfg = self.config
+
+        # Build the 2D array — shape (N_STREAMS, n_samples)
+        pos_data = np.zeros((N_STREAMS, cfg.n_samples), dtype=np.float64)
+        for i, ch in enumerate(ALL_CHANNELS):
+            if ch in data:
+                pos_data[i] = data[ch]
+
+        with h5py.File(filepath, "w") as f:
+            grp = f.require_group("beads/data")
+            ds = grp.create_dataset(
+                "pos_data",
+                data=pos_data,
+                compression="gzip",
+                compression_opts=1,
+            )
+
+            # Dataset attributes — names and dtypes match the reference file
+            ds.attrs["Fsamp"]              = cfg.sample_rate                   # float64
+            ds.attrs["Time"]               = time.time()                        # float64, Unix timestamp
+            ds.attrs["EOM_voltage"]        = 0.0                                # float64, placeholder
+            ds.attrs["PID"]                = np.zeros(10, dtype=np.float32)     # float32[10], placeholder
+            ds.attrs["dc_supply_settings"] = np.zeros(3,  dtype=np.float64)     # float64[3], placeholder
+            ds.attrs["pressures"]          = np.zeros(2,  dtype=np.float64)     # float64[2], placeholder
+            ds.attrs["temps"]              = np.zeros(2,  dtype=np.float64)     # float64[2], placeholder
 
     def _acquire_one_file(self, file_index: int) -> bool:
         """
