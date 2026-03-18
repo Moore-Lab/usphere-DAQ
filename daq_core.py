@@ -23,10 +23,66 @@ try:
 except ImportError:
     NIDAQMX_AVAILABLE = False
 
+
+# ---------------------------------------------------------------------------
+# Device plugin registry
+# ---------------------------------------------------------------------------
+# Each plugin module must live alongside daq_core.py and expose:
+#
+#   DEVICE_NAME : str   — label printed in status/log messages
+#   DEFAULTS    : dict  — H5 attribute values used when the device is absent
+#   read()      : dict  — reads live values; MUST raise on any error
+#
+# daq_core calls every registered plugin at the start of each file acquisition.
+# If read() raises for any reason the plugin's DEFAULTS are substituted, so a
+# missing or crashing device never prevents a file from being written.
+#
+# To add a new device: create a new module following the protocol above,
+# then append its name to _PLUGIN_MODULES below.
+# ---------------------------------------------------------------------------
+
+_PLUGIN_MODULES: list[str] = [
+    "daq_fpga",
+    # "daq_pressure",   # <-- add future device modules here
+]
+
+# Populated at import time: list of (display_name, read_fn, defaults_dict)
+_PLUGINS: list[tuple[str, object, dict]] = []
+
+
+def _load_plugins() -> None:
+    import importlib
+    for module_name in _PLUGIN_MODULES:
+        try:
+            mod = importlib.import_module(module_name)
+            _PLUGINS.append((mod.DEVICE_NAME, mod.read, mod.DEFAULTS))
+        except Exception:
+            pass  # module absent or broken at import — skip silently
+
+
+_load_plugins()
+
+
+def _collect_device_attrs(log_fn) -> dict:
+    """
+    Query every registered plugin and merge their results into one dict.
+    Plugins that raise are logged at WARNING level and their DEFAULTS used,
+    so this function always returns a complete set of H5 attribute values.
+    """
+    attrs: dict = {}
+    for name, read_fn, defaults in _PLUGINS:
+        try:
+            attrs.update(read_fn())
+        except Exception as exc:
+            log_fn(f"  [WARN] {name}: {exc} — using defaults")
+            attrs.update(defaults)
+    return attrs
+
+
 # Number of data streams in every output file.
 # Matches the reference file structure: beads/data/pos_data shape (N_STREAMS, n_samples).
 # Change this constant if the channel count changes; the file schema follows automatically.
-N_STREAMS: int = 17
+N_STREAMS: int = 32
 ALL_CHANNELS: list[str] = [f"ai{i}" for i in range(N_STREAMS)]
 
 
@@ -137,7 +193,12 @@ class DAQRecorder:
         out.mkdir(parents=True, exist_ok=True)
         return out / f"{self.config.basename}_{index}.h5"
 
-    def _write_h5(self, filepath: Path, data: dict[str, np.ndarray]):
+    def _write_h5(
+        self,
+        filepath: Path,
+        data: dict[str, np.ndarray],
+        device_attrs: dict,
+    ):
         """
         Write one HDF5 file matching the reference structure:
 
@@ -145,6 +206,9 @@ class DAQRecorder:
 
         Active channels fill their row; unrecorded streams are left as zeros.
         All metadata is stored as dataset-level attributes to match the template.
+        Device-supplied attributes (PID gains, pressures, …) come from
+        device_attrs, which is already pre-filled with plugin defaults wherever
+        a device was unavailable.
 
         Note: the reference file uses dtype int16 (raw ADC counts). We store
         float64 (calibrated volts from nidaqmx) so the schema is structurally
@@ -168,14 +232,16 @@ class DAQRecorder:
                 compression_opts=1,
             )
 
-            # Dataset attributes — names and dtypes match the reference file
-            ds.attrs["Fsamp"]              = cfg.sample_rate                   # float64
-            ds.attrs["Time"]               = time.time()                        # float64, Unix timestamp
-            ds.attrs["EOM_voltage"]        = 0.0                                # float64, placeholder
-            ds.attrs["PID"]                = np.zeros(10, dtype=np.float32)     # float32[10], placeholder
-            ds.attrs["dc_supply_settings"] = np.zeros(3,  dtype=np.float64)     # float64[3], placeholder
-            ds.attrs["pressures"]          = np.zeros(2,  dtype=np.float64)     # float64[2], placeholder
-            ds.attrs["temps"]              = np.zeros(2,  dtype=np.float64)     # float64[2], placeholder
+            # Fixed attributes — always written by daq_core
+            ds.attrs["Fsamp"] = cfg.sample_rate   # float64
+            ds.attrs["Time"]  = time.time()        # float64, Unix timestamp
+
+            # Device-supplied attributes — populated by plugins, zeros if unavailable
+            ds.attrs["EOM_voltage"]        = device_attrs.get("EOM_voltage",        0.0)
+            ds.attrs["PID"]                = device_attrs.get("PID",                np.zeros(10, dtype=np.float32))
+            ds.attrs["dc_supply_settings"] = device_attrs.get("dc_supply_settings", np.zeros(3,  dtype=np.float64))
+            ds.attrs["pressures"]          = device_attrs.get("pressures",          np.zeros(2,  dtype=np.float64))
+            ds.attrs["temps"]              = device_attrs.get("temps",              np.zeros(2,  dtype=np.float64))
 
     def _acquire_one_file(self, file_index: int) -> bool:
         """
@@ -253,7 +319,8 @@ class DAQRecorder:
             for ch in active:
                 data[ch] = np.concatenate(buffers[ch])
 
-        self._write_h5(filepath, data)
+        device_attrs = _collect_device_attrs(self._log)
+        self._write_h5(filepath, data, device_attrs)
         self._log(f"  -> Saved: {filepath}")
         if self._on_file_written:
             self._on_file_written(filepath)
