@@ -23,6 +23,7 @@ from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -234,6 +235,27 @@ class _RecorderSignals(QObject):
 
 
 # ---------------------------------------------------------------------------
+# NI PXIe-6363 discrete input ranges
+# DAQmx selects the smallest range that contains (min_val, max_val).
+# Presenting only the exact hardware ranges avoids silent rounding.
+# LSB = full_scale / 2^16  (16-bit ADC)
+# ---------------------------------------------------------------------------
+
+_VOLTAGE_RANGES: list[tuple[str, float, float]] = [
+    ("±0.1 V  (LSB ≈ 3 µV)",   -0.1,  0.1),
+    ("±0.2 V  (LSB ≈ 6 µV)",   -0.2,  0.2),
+    ("±0.5 V  (LSB ≈ 15 µV)",  -0.5,  0.5),
+    ("±1 V    (LSB ≈ 30 µV)",  -1.0,  1.0),
+    ("±2 V    (LSB ≈ 61 µV)",  -2.0,  2.0),
+    ("±5 V    (LSB ≈ 153 µV)", -5.0,  5.0),
+    ("±10 V   (LSB ≈ 305 µV)", -10.0, 10.0),
+]
+
+# Default to ±10 V
+_DEFAULT_VRANGE_INDEX = 6
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -365,14 +387,12 @@ class MainWindow(QMainWindow):
         g.addWidget(self._duration_lbl, r, 1)
         r += 1
 
-        g.addWidget(QLabel("Voltage min (V):"), r, 0)
-        self._vmin_edit = QLineEdit()
-        g.addWidget(self._vmin_edit, r, 1)
-        r += 1
-
-        g.addWidget(QLabel("Voltage max (V):"), r, 0)
-        self._vmax_edit = QLineEdit()
-        g.addWidget(self._vmax_edit, r, 1)
+        g.addWidget(QLabel("Input voltage range:"), r, 0)
+        self._vrange_combo = QComboBox()
+        for label, _, _ in _VOLTAGE_RANGES:
+            self._vrange_combo.addItem(label)
+        self._vrange_combo.setCurrentIndex(_DEFAULT_VRANGE_INDEX)
+        g.addWidget(self._vrange_combo, r, 1)
 
         outer.addWidget(acq)
 
@@ -454,8 +474,14 @@ class MainWindow(QMainWindow):
         self._device_edit.setText(cfg.device)
         self._sr_edit.setText(str(cfg.sample_rate))
         self._bits_spin.setValue(cfg.n_bits)
-        self._vmin_edit.setText(str(cfg.voltage_min))
-        self._vmax_edit.setText(str(cfg.voltage_max))
+        # Select the combo entry whose (min, max) matches the saved config;
+        # fall back to the default index if no exact match is found.
+        idx = _DEFAULT_VRANGE_INDEX
+        for i, (_, vmin, vmax) in enumerate(_VOLTAGE_RANGES):
+            if vmin == cfg.voltage_min and vmax == cfg.voltage_max:
+                idx = i
+                break
+        self._vrange_combo.setCurrentIndex(idx)
         self._dir_edit.setText(str(cfg.output_dir))
         self._basename_edit.setText(cfg.basename)
         self._nfiles_spin.setValue(cfg.n_files)
@@ -470,6 +496,8 @@ class MainWindow(QMainWindow):
             except ValueError:
                 return fallback
 
+        _, vmin, vmax = _VOLTAGE_RANGES[self._vrange_combo.currentIndex()]
+
         return DAQConfig(
             device=self._device_edit.text().strip(),
             active_channels=[ch for ch, cb in self._ch_boxes.items() if cb.isChecked()],
@@ -478,8 +506,8 @@ class MainWindow(QMainWindow):
             output_dir=self._dir_edit.text().strip(),
             basename=self._basename_edit.text().strip(),
             n_files=self._nfiles_spin.value(),
-            voltage_min=_float(self._vmin_edit, -10.0),
-            voltage_max=_float(self._vmax_edit, 10.0),
+            voltage_min=vmin,
+            voltage_max=vmax,
             module_configs=self._modules_tab.get_all_configs(),
         )
 
@@ -548,7 +576,7 @@ class MainWindow(QMainWindow):
     def _set_inputs_enabled(self, enabled: bool):
         for w in (
             self._device_edit, self._sr_edit, self._bits_spin,
-            self._vmin_edit, self._vmax_edit,
+            self._vrange_combo,
             self._dir_edit, self._basename_edit, self._nfiles_spin,
         ):
             w.setEnabled(enabled)
