@@ -13,8 +13,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import h5py
 import numpy as np
+import daq_h5
 
 try:
     import nidaqmx
@@ -46,8 +46,8 @@ _PLUGIN_MODULES: list[str] = [
     # "daq_pressure",   # <-- add future device modules here
 ]
 
-# Populated at import time: list of (display_name, read_fn, defaults_dict)
-_PLUGINS: list[tuple[str, object, dict]] = []
+# Populated at import time: list of plugin module objects
+_PLUGINS: list = []
 
 
 def _load_plugins() -> None:
@@ -55,7 +55,7 @@ def _load_plugins() -> None:
     for module_name in _PLUGIN_MODULES:
         try:
             mod = importlib.import_module(module_name)
-            _PLUGINS.append((mod.DEVICE_NAME, mod.read, mod.DEFAULTS))
+            _PLUGINS.append(mod)
         except Exception:
             pass  # module absent or broken at import — skip silently
 
@@ -63,27 +63,28 @@ def _load_plugins() -> None:
 _load_plugins()
 
 
-def _collect_device_attrs(log_fn) -> dict:
+def get_plugins() -> list:
+    """Return registered plugin module objects (used by the GUI Modules tab)."""
+    return list(_PLUGINS)
+
+
+def _collect_module_data(log_fn, module_configs: dict) -> dict[str, dict]:
     """
-    Query every registered plugin and merge their results into one dict.
-    Plugins that raise are logged at WARNING level and their DEFAULTS used,
-    so this function always returns a complete set of H5 attribute values.
+    Query every registered plugin and return {MODULE_NAME: {attr: value}}.
+
+    config for each plugin is looked up by MODULE_NAME from module_configs.
+    Plugins that raise have their DEFAULTS substituted so a missing device
+    never prevents a file from being written.
     """
-    attrs: dict = {}
-    for name, read_fn, defaults in _PLUGINS:
+    result: dict[str, dict] = {}
+    for mod in _PLUGINS:
+        config = module_configs.get(mod.MODULE_NAME, {})
         try:
-            attrs.update(read_fn())
+            result[mod.MODULE_NAME] = mod.read(config)
         except Exception as exc:
-            log_fn(f"  [WARN] {name}: {exc} — using defaults")
-            attrs.update(defaults)
-    return attrs
-
-
-# Number of data streams in every output file.
-# Matches the reference file structure: beads/data/pos_data shape (N_STREAMS, n_samples).
-# Change this constant if the channel count changes; the file schema follows automatically.
-N_STREAMS: int = 32
-ALL_CHANNELS: list[str] = [f"ai{i}" for i in range(N_STREAMS)]
+            log_fn(f"  [WARN] {mod.DEVICE_NAME}: {exc} — using defaults")
+            result[mod.MODULE_NAME] = dict(mod.DEFAULTS)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,7 @@ class DAQConfig:
     n_files: int = 1                    # 0 = run continuously until stopped
     voltage_min: float = -10.0          # V
     voltage_max: float = 10.0           # V
+    module_configs: dict = field(default_factory=dict)  # {MODULE_NAME: {key: value}}
 
     @property
     def n_samples(self) -> int:
@@ -121,6 +123,7 @@ class DAQConfig:
             "n_files": self.n_files,
             "voltage_min": self.voltage_min,
             "voltage_max": self.voltage_max,
+            "module_configs": dict(self.module_configs),
         }
 
     @classmethod
@@ -197,51 +200,17 @@ class DAQRecorder:
         self,
         filepath: Path,
         data: dict[str, np.ndarray],
-        device_attrs: dict,
+        module_data: dict[str, dict],
     ):
-        """
-        Write one HDF5 file matching the reference structure:
-
-            beads/data/pos_data   shape (N_STREAMS, n_samples)
-
-        Active channels fill their row; unrecorded streams are left as zeros.
-        All metadata is stored as dataset-level attributes to match the template.
-        Device-supplied attributes (PID gains, pressures, …) come from
-        device_attrs, which is already pre-filled with plugin defaults wherever
-        a device was unavailable.
-
-        Note: the reference file uses dtype int16 (raw ADC counts). We store
-        float64 (calibrated volts from nidaqmx) so the schema is structurally
-        identical but values are in physical units. Convert to int16 in
-        post-processing if raw counts are needed.
-        """
+        """Delegate all file writing to daq_h5 — schema lives there."""
         cfg = self.config
-
-        # Build the 2D array — shape (N_STREAMS, n_samples)
-        pos_data = np.zeros((N_STREAMS, cfg.n_samples), dtype=np.float64)
-        for i, ch in enumerate(ALL_CHANNELS):
-            if ch in data:
-                pos_data[i] = data[ch]
-
-        with h5py.File(filepath, "w") as f:
-            grp = f.require_group("beads/data")
-            ds = grp.create_dataset(
-                "pos_data",
-                data=pos_data,
-                compression="gzip",
-                compression_opts=1,
-            )
-
-            # Fixed attributes — always written by daq_core
-            ds.attrs["Fsamp"] = cfg.sample_rate   # float64
-            ds.attrs["Time"]  = time.time()        # float64, Unix timestamp
-
-            # Device-supplied attributes — populated by plugins, zeros if unavailable
-            ds.attrs["EOM_voltage"]        = device_attrs.get("EOM_voltage",        0.0)
-            ds.attrs["PID"]                = device_attrs.get("PID",                np.zeros(10, dtype=np.float32))
-            ds.attrs["dc_supply_settings"] = device_attrs.get("dc_supply_settings", np.zeros(3,  dtype=np.float64))
-            ds.attrs["pressures"]          = device_attrs.get("pressures",          np.zeros(2,  dtype=np.float64))
-            ds.attrs["temps"]              = device_attrs.get("temps",              np.zeros(2,  dtype=np.float64))
+        daq_h5.write(
+            filepath=filepath,
+            channel_data=data,
+            n_samples=cfg.n_samples,
+            fsamp=cfg.sample_rate,
+            module_data=module_data,
+        )
 
     def _acquire_one_file(self, file_index: int) -> bool:
         """
@@ -319,8 +288,8 @@ class DAQRecorder:
             for ch in active:
                 data[ch] = np.concatenate(buffers[ch])
 
-        device_attrs = _collect_device_attrs(self._log)
-        self._write_h5(filepath, data, device_attrs)
+        module_data = _collect_module_data(self._log, cfg.module_configs)
+        self._write_h5(filepath, data, module_data)
         self._log(f"  -> Saved: {filepath}")
         if self._on_file_written:
             self._on_file_written(filepath)

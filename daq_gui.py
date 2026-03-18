@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime
 import json
 import sys
+import threading
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
@@ -41,7 +42,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from daq_core import ALL_CHANNELS, DAQConfig, DAQRecorder
+from daq_core import DAQConfig, DAQRecorder, get_plugins
+from daq_h5 import ALL_CHANNELS
 from daq_plot import PlotWidget
 
 # Rolling session log — sits alongside this script
@@ -73,6 +75,142 @@ def append_log(config: DAQConfig):
     }
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Modules tab widget
+# Dynamically builds one settings group per registered plugin.
+# Each plugin's CONFIG_FIELDS list drives the form fields automatically.
+# ---------------------------------------------------------------------------
+
+class ModulesWidget(QWidget):
+    """
+    Renders one collapsible section per registered plugin, driven by each
+    plugin's CONFIG_FIELDS list.  Provides per-module Test buttons and
+    persists configs via get_all_configs() / set_all_configs().
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._plugins = get_plugins()
+        self._fields: dict[str, dict[str, QLineEdit]] = {}  # module_name -> {key: widget}
+        self._status_labels: dict[str, QLabel] = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setSpacing(10)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        if not self._plugins:
+            outer.addWidget(QLabel("No device modules registered."))
+            outer.addStretch()
+            return
+
+        for mod in self._plugins:
+            outer.addWidget(self._make_module_group(mod))
+
+        outer.addStretch()
+
+    def _make_module_group(self, mod) -> QGroupBox:
+        box = QGroupBox(mod.DEVICE_NAME)
+        g = QGridLayout(box)
+        g.setColumnStretch(1, 1)
+
+        row = 0
+        self._fields[mod.MODULE_NAME] = {}
+
+        for field_def in mod.CONFIG_FIELDS:
+            key    = field_def["key"]
+            label  = field_def["label"]
+            ftype  = field_def.get("type", "text")
+            default = field_def.get("default", "")
+
+            g.addWidget(QLabel(f"{label}:"), row, 0)
+
+            edit = QLineEdit(str(default))
+            self._fields[mod.MODULE_NAME][key] = edit
+            g.addWidget(edit, row, 1)
+
+            if ftype == "file":
+                ffilter = field_def.get("filter", "All files (*)")
+                browse = QPushButton("Browse…")
+                browse.setMaximumWidth(70)
+                browse.clicked.connect(
+                    lambda _checked, e=edit, ff=ffilter: self._browse_file(e, ff)
+                )
+                g.addWidget(browse, row, 2)
+
+            row += 1
+
+        # Test button + status label
+        test_btn = QPushButton("Test connection")
+        test_btn.setMaximumWidth(130)
+        test_btn.clicked.connect(lambda _checked, m=mod: self._run_test(m))
+        g.addWidget(test_btn, row, 0)
+
+        status_lbl = QLabel("—")
+        status_lbl.setWordWrap(True)
+        status_lbl.setStyleSheet("color: gray;")
+        self._status_labels[mod.MODULE_NAME] = status_lbl
+        g.addWidget(status_lbl, row, 1, 1, 2)
+
+        return box
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _browse_file(self, edit: QLineEdit, file_filter: str):
+        start = str(Path(edit.text()).parent) if edit.text() else ""
+        path, _ = QFileDialog.getOpenFileName(self, "Select file", start, file_filter)
+        if path:
+            edit.setText(path)
+
+    def _run_test(self, mod):
+        """Run mod.test() in a worker thread; update the status label when done."""
+        config = self.get_module_config(mod.MODULE_NAME)
+        lbl = self._status_labels[mod.MODULE_NAME]
+        lbl.setText("Testing…")
+        lbl.setStyleSheet("color: gray;")
+
+        def _worker():
+            ok, msg = mod.test(config)
+            # Qt widgets must be updated from the main thread — use a one-shot
+            # connection via a local QObject signal trick isn't available here,
+            # so we use a simple lambda posted via QApplication.instance().
+            from PyQt5.QtCore import QMetaObject, Qt as _Qt
+            def _update():
+                lbl.setText(msg)
+                lbl.setStyleSheet("color: green;" if ok else "color: red;")
+            # postEvent approach: schedule on the main thread
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, _update)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Config access (called by MainWindow)
+    # ------------------------------------------------------------------
+
+    def get_module_config(self, module_name: str) -> dict:
+        """Return the current field values for one module."""
+        return {
+            key: edit.text()
+            for key, edit in self._fields.get(module_name, {}).items()
+        }
+
+    def get_all_configs(self) -> dict:
+        """Return {MODULE_NAME: {key: value}} for all modules."""
+        return {name: self.get_module_config(name) for name in self._fields}
+
+    def set_all_configs(self, configs: dict):
+        """Restore saved configs — missing keys are left at their defaults."""
+        for module_name, values in configs.items():
+            for key, val in values.items():
+                widget = self._fields.get(module_name, {}).get(key)
+                if widget is not None:
+                    widget.setText(str(val))
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +273,11 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(acquire_w, "Acquire")
 
-        # --- Tab 2: Plot ---
+        # --- Tab 2: Modules ---
+        self._modules_tab = ModulesWidget()
+        tabs.addTab(self._modules_tab, "Modules")
+
+        # --- Tab 3: Plot ---
         self._plot_tab = PlotWidget()
         tabs.addTab(self._plot_tab, "Plot")
 
@@ -297,6 +439,7 @@ class MainWindow(QMainWindow):
     def _load_initial_config(self):
         cfg = load_last_config() or DAQConfig()
         self._apply_config(cfg)
+        self._modules_tab.set_all_configs(cfg.module_configs)
         self._update_derived()
 
     def _apply_config(self, cfg: DAQConfig):
@@ -329,6 +472,7 @@ class MainWindow(QMainWindow):
             n_files=self._nfiles_spin.value(),
             voltage_min=_float(self._vmin_edit, -10.0),
             voltage_max=_float(self._vmax_edit, 10.0),
+            module_configs=self._modules_tab.get_all_configs(),
         )
 
     # ------------------------------------------------------------------

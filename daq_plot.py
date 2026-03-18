@@ -17,14 +17,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import h5py
 import numpy as np
 from scipy.signal import welch
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 
-from daq_core import ALL_CHANNELS, N_STREAMS
+from daq_h5 import ALL_CHANNELS, N_STREAMS, recorded_channels, read_channel
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
@@ -48,38 +47,16 @@ from PyQt5.QtWidgets import (
 )
 
 
-# Path to the dataset within every output file (mirrors the reference structure)
-_DATASET_PATH = "beads/data/pos_data"
-
-
 # ---------------------------------------------------------------------------
-# HDF5 helpers
+# HDF5 helpers — thin wrappers around daq_h5 for backward compatibility
 # ---------------------------------------------------------------------------
 
 def get_channel_info(filepath: str | Path) -> dict[str, bool]:
-    """
-    Return {stream_name: is_recorded} for all N_STREAMS rows.
-    A row is considered 'recorded' if it contains any non-zero value.
-    """
-    with h5py.File(filepath, "r") as f:
-        ds = f[_DATASET_PATH]
-        return {
-            ch: bool(np.any(ds[i, :] != 0)) if i < ds.shape[0] else False
-            for i, ch in enumerate(ALL_CHANNELS)
-        }
+    return recorded_channels(filepath)
 
 
 def load_channel(filepath: str | Path, channel: str) -> tuple[np.ndarray, float]:
-    """
-    Return (data_array, sample_rate_hz) for the given stream name.
-    Reads one row from beads/data/pos_data.
-    """
-    idx = ALL_CHANNELS.index(channel)
-    with h5py.File(filepath, "r") as f:
-        ds = f[_DATASET_PATH]
-        data = ds[idx, :]
-        sr = float(ds.attrs["Fsamp"])
-    return data, sr
+    return read_channel(filepath, channel)
 
 
 def fmt_duration(secs: float) -> str:

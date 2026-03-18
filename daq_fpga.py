@@ -4,22 +4,19 @@ daq_fpga.py
 Device plugin for the NI PXIe-7856R FPGA module.
 Reads PID feedback parameters via the nifpga Python interface.
 
-Plugin protocol (required by daq_core.py)
-------------------------------------------
-  DEVICE_NAME : str   — label used in log messages
-  DEFAULTS    : dict  — H5 attribute values written when the device is unavailable
-  read()      : dict  — reads live values; must raise on any error so
-                        daq_core can catch it and fall back to DEFAULTS
+Plugin protocol (required by daq_core)
+---------------------------------------
+  MODULE_NAME   : str        — dataset name written inside beads/data/ in the H5 file
+  DEVICE_NAME   : str        — human-readable label for log messages and the GUI
+  CONFIG_FIELDS : list[dict] — describes the GUI fields; keys: key, label, type,
+                               default, and (for file fields) filter
+  DEFAULTS      : dict       — attribute values written when the device is unavailable
+  read(config)  : dict       — read live values using config; raises on any error
+  test(config)  : (bool,str) — try read(); return (success, message) for the GUI
 
-Adding this device to daq_core
--------------------------------
-This module is auto-loaded by daq_core via _load_plugin("daq_fpga").
-No other changes to daq_core are needed.
-
-Dependencies
-------------
-    pip install nifpga
-NI-RIO driver must also be installed (ships with LabVIEW or NI-RIO standalone).
+Bitfile and resource are supplied at runtime via config (from the Modules tab),
+not hardcoded here.  Default values shown in CONFIG_FIELDS appear in the GUI on
+first launch; they are then saved to the session log and restored automatically.
 """
 
 from __future__ import annotations
@@ -34,80 +31,116 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration — update these if the bitfile or slot changes
+# Plugin identity
 # ---------------------------------------------------------------------------
 
-BITFILE = (
-    r"C:\Users\yalem\GitHub\Documents\Optlev\LabView Code"
-    r"\FPGA code\FPGA Bitfiles"
-    r"\Microspherefeedb_FPGATarget2_Notches_all_channels_20260203_DCM.lvbitx"
-)
+MODULE_NAME = "FPGA"
+DEVICE_NAME = "NI PXIe-7856R FPGA"
 
-# Device resource name as shown in NI MAX (e.g. "RIO0" or "PXI1Slot3").
-# Verify with NI MAX if reads fail — FlexRIO cards sometimes appear as "RIO<n>"
-# rather than the chassis slot address.
-RESOURCE = "PXI1Slot2"
 
-# Ordered list of FPGA control names exactly as they appear in the LabVIEW VI.
-# The position in this list determines the index in the 10-element PID array
-# stored in the H5 file under ds.attrs["PID"].
-CONTROL_NAMES: list[str] = [
-    "Dg X",         # [0] Derivative gain,    X axis
-    "Ig X",         # [1] Integral gain,       X axis
-    "Dg Y",         # [2] Derivative gain,     Y axis
-    "Ig Y",         # [3] Integral gain,       Y axis
-    "Pg Z",         # [4] Proportional gain,   Z axis
-    "Ig Z",         # [5] Integral gain,       Z axis
-    "Dg Z",         # [6] Derivative gain,     Z axis
-    "DC offset X",  # [7] DC offset,           X axis
-    "DC offset Y",  # [8] DC offset,           Y axis
-    "DC offset Z",  # [9] DC offset,           Z axis
+# ---------------------------------------------------------------------------
+# GUI configuration fields
+# Rendered automatically by ModulesWidget in daq_gui.py.
+# Each dict: key (config key), label (display), type ("text" or "file"),
+#            default (pre-filled value), filter (file dialog, file type only).
+# ---------------------------------------------------------------------------
+
+CONFIG_FIELDS: list[dict] = [
+    {
+        "key":     "bitfile",
+        "label":   "Bitfile (.lvbitx)",
+        "type":    "file",
+        "filter":  "FPGA Bitfiles (*.lvbitx);;All files (*)",
+        "default": (
+            r"C:\Users\yalem\GitHub\Documents\Optlev\LabView Code"
+            r"\FPGA code\FPGA Bitfiles"
+            r"\Microspherefeedb_FPGATarget2_Notches_all_channels_20260203_DCM.lvbitx"
+        ),
+    },
+    {
+        "key":     "resource",
+        "label":   "Resource name",
+        "type":    "text",
+        "default": "PXI1Slot2",
+    },
 ]
+
+
+# ---------------------------------------------------------------------------
+# FPGA control names
+# Order determines the logical grouping in the H5 attrs; each name is used
+# as-is as both the nifpga register key and the H5 attribute name.
+# ---------------------------------------------------------------------------
+
+CONTROL_NAMES: list[str] = [
+    "Dg X",         # Derivative gain,    X axis
+    "Ig X",         # Integral gain,       X axis
+    "Dg Y",         # Derivative gain,     Y axis
+    "Ig Y",         # Integral gain,       Y axis
+    "Pg Z",         # Proportional gain,   Z axis
+    "Ig Z",         # Integral gain,       Z axis
+    "Dg Z",         # Derivative gain,     Z axis
+    "DC offset X",  # DC offset,           X axis
+    "DC offset Y",  # DC offset,           Y axis
+    "DC offset Z",  # DC offset,           Z axis
+]
+
+# Default values used when the device is unavailable — written as zeros to H5
+DEFAULTS: dict = {name: 0.0 for name in CONTROL_NAMES}
 
 
 # ---------------------------------------------------------------------------
 # Plugin interface
 # ---------------------------------------------------------------------------
 
-DEVICE_NAME = "NI PXIe-7856R FPGA"
-
-# Values used when the FPGA is unreachable — same shape/dtype as live data
-DEFAULTS: dict = {
-    "PID": np.zeros(len(CONTROL_NAMES), dtype=np.float32),
-}
-
-
-def read() -> dict:
+def read(config: dict) -> dict:
     """
-    Open a read-only FPGA session, sample all PID controls, and return them.
+    Open a read-only FPGA session and sample all PID controls.
 
-    The session is opened with run=False and reset_if_last_session_on_exit=False
-    so that a running LabVIEW VI is not interrupted.
+    Parameters
+    ----------
+    config : dict with keys "bitfile" and "resource"
+
+    Returns
+    -------
+    dict mapping each control name to its float value
 
     Raises
     ------
-    RuntimeError
-        If nifpga is not installed.
-    nifpga.ErrorStatus (or any other exception)
-        If the device is unreachable or a register name is wrong.
-        daq_core catches all exceptions and falls back to DEFAULTS.
+    RuntimeError   if nifpga is not installed
+    KeyError       if "bitfile" or "resource" missing from config
+    Any nifpga exception if the device is unreachable or a name is wrong
     """
     if not NIFPGA_AVAILABLE:
-        raise RuntimeError(
-            "nifpga package not installed — run: pip install nifpga"
-        )
+        raise RuntimeError("nifpga not installed — run: pip install nifpga")
 
-    values: list[float] = []
+    bitfile  = config["bitfile"]
+    resource = config["resource"]
+
     with nifpga.Session(
-        bitfile=BITFILE,
-        resource=RESOURCE,
+        bitfile=bitfile,
+        resource=resource,
         run=False,                          # do not start/restart the FPGA
-        reset_if_last_session_on_exit=False,# do not reset the FPGA on close
+        reset_if_last_session_on_exit=False,# do not reset on close
     ) as session:
-        for name in CONTROL_NAMES:
-            values.append(float(session.registers[name].read()))
+        return {name: float(session.registers[name].read()) for name in CONTROL_NAMES}
 
-    return {"PID": np.array(values, dtype=np.float32)}
+
+def test(config: dict) -> tuple[bool, str]:
+    """
+    Attempt a read and return (success, message).
+    Called from the GUI Test button — safe to call from a worker thread.
+    """
+    try:
+        values = read(config)
+        sample = ", ".join(f"{k}={v:.4g}" for k, v in list(values.items())[:3])
+        return True, f"OK — read {len(values)} parameters  ({sample}, …)"
+    except KeyError as e:
+        return False, f"Missing config field: {e}"
+    except RuntimeError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +148,17 @@ def read() -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"Connecting to {DEVICE_NAME} ({RESOURCE})…")
-    try:
-        result = read()
-        pid = result["PID"]
-        print("PID parameters read successfully:")
-        for name, val in zip(CONTROL_NAMES, pid):
+    import sys
+
+    cfg = {
+        "bitfile":  CONFIG_FIELDS[0]["default"],
+        "resource": CONFIG_FIELDS[1]["default"],
+    }
+    print(f"Testing {DEVICE_NAME}  ({cfg['resource']})…")
+    ok, msg = test(cfg)
+    print(f"{'OK' if ok else 'FAILED'}: {msg}")
+    if ok:
+        values = read(cfg)
+        print("\nPID parameters:")
+        for name, val in values.items():
             print(f"  {name:<16s}: {val:.6g}")
-    except Exception as e:
-        print(f"Error: {e}")
-        print("Defaults would be written to H5:")
-        for name, val in zip(CONTROL_NAMES, DEFAULTS["PID"]):
-            print(f"  {name:<16s}: {val}")
