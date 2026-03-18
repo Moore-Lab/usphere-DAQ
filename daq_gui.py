@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -647,6 +647,10 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    icon_path = Path(__file__).parent / "assets" / "Logo_transparent_outlined.PNG"
+    if icon_path.exists():
+        icon = QIcon(str(icon_path))
+        app.setWindowIcon(icon)
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
