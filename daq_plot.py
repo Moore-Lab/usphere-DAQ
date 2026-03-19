@@ -5,8 +5,10 @@ PlotWidget: PyQt5 widget for visualizing usphere-DAQ HDF5 files.
 Embedded as the "Plot" tab in daq_gui.py.
 
 Features:
-  - Two persistent side-by-side plots: time domain and PSD (Welch)
+  - Two persistent side-by-side plots: time domain and ASD/PSD (Welch)
+  - ASD (V/√Hz) or PSD (V²/Hz) selectable, ASD default
   - Multi-channel overlay: select any combination of channels
+  - Bandpass filter (Butterworth) with configurable f_low, f_high, order
   - Live mode: automatically re-plots whenever a new file is written
 
 Standalone usage:
@@ -18,17 +20,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import welch
+from scipy.signal import welch, butter, sosfilt
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 
-from daq_h5 import ALL_CHANNELS, N_STREAMS, recorded_channels, read_channel
+from daq_h5 import ALL_CHANNELS, recorded_channels, read_channel
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -39,7 +42,6 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -75,7 +77,7 @@ def fmt_duration(secs: float) -> str:
 
 class PlotWidget(QWidget):
     """
-    Dual-panel (time + PSD) plot viewer with multi-channel overlay.
+    Dual-panel (time + ASD/PSD) plot viewer with multi-channel overlay.
 
     External API
     ------------
@@ -169,10 +171,11 @@ class PlotWidget(QWidget):
         ch_row.addWidget(scroll, stretch=1)
         outer.addLayout(ch_row)
 
-        # Settings + action buttons row
+        # --- Settings row ---
         settings_row = QHBoxLayout()
         settings_row.setSpacing(10)
 
+        # Welch segment
         settings_row.addWidget(QLabel("Welch segment (2^N):"))
         self._nperseg_spin = QSpinBox()
         self._nperseg_spin.setRange(6, 22)
@@ -186,7 +189,18 @@ class PlotWidget(QWidget):
 
         settings_row.addWidget(_vsep())
 
+        # ASD / PSD selector
+        settings_row.addWidget(QLabel("Spectrum:"))
+        self._spectrum_combo = QComboBox()
+        self._spectrum_combo.addItems(["ASD  (V/√Hz)", "PSD  (V²/Hz)"])
+        self._spectrum_combo.setCurrentIndex(0)   # ASD default
+        settings_row.addWidget(self._spectrum_combo)
+
+        settings_row.addWidget(_vsep())
+
+        # Log axes — log X default for frequency plot
         self._logx_cb = QCheckBox("Log X")
+        self._logx_cb.setChecked(True)
         self._logy_cb = QCheckBox("Log Y")
         self._logy_cb.setChecked(True)
         settings_row.addWidget(self._logx_cb)
@@ -212,7 +226,41 @@ class PlotWidget(QWidget):
         settings_row.addWidget(clear_btn)
 
         outer.addLayout(settings_row)
+
+        # --- Bandpass filter row ---
+        outer.addWidget(self._make_filter_row())
+
         return box
+
+    def _make_filter_row(self) -> QWidget:
+        w = QWidget()
+        row = QHBoxLayout(w)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self._bp_enable = QCheckBox("Bandpass filter")
+        self._bp_enable.setChecked(False)
+        row.addWidget(self._bp_enable)
+
+        row.addWidget(QLabel("f low (Hz):"))
+        self._bp_low = QLineEdit("10")
+        self._bp_low.setMaximumWidth(70)
+        row.addWidget(self._bp_low)
+
+        row.addWidget(QLabel("f high (Hz):"))
+        self._bp_high = QLineEdit("1000")
+        self._bp_high.setMaximumWidth(70)
+        row.addWidget(self._bp_high)
+
+        row.addWidget(QLabel("Order:"))
+        self._bp_order = QSpinBox()
+        self._bp_order.setRange(1, 10)
+        self._bp_order.setValue(4)
+        self._bp_order.setMaximumWidth(55)
+        row.addWidget(self._bp_order)
+
+        row.addStretch()
+        return w
 
     # --- Dual matplotlib panels ---
 
@@ -227,13 +275,13 @@ class PlotWidget(QWidget):
         time_w = _plot_panel("Time Domain", self._time_toolbar, self._time_canvas)
         splitter.addWidget(time_w)
 
-        # PSD
+        # Frequency domain (ASD/PSD)
         self._psd_fig = Figure(tight_layout=True)
         self._psd_ax  = self._psd_fig.add_subplot(111)
         self._psd_canvas  = FigureCanvasQTAgg(self._psd_fig)
         self._psd_toolbar = NavigationToolbar2QT(self._psd_canvas, self)
-        psd_w = _plot_panel("Frequency (PSD)", self._psd_toolbar, self._psd_canvas)
-        splitter.addWidget(psd_w)
+        self._psd_panel_w = _plot_panel("Frequency", self._psd_toolbar, self._psd_canvas)
+        splitter.addWidget(self._psd_panel_w)
 
         splitter.setSizes([500, 500])
         return splitter
@@ -270,6 +318,20 @@ class PlotWidget(QWidget):
         if checked and self._filepath:
             self._plot()
 
+    def _apply_bandpass(self, data: np.ndarray, sr: float) -> np.ndarray:
+        """Return bandpass-filtered data, or original data if filter params are invalid."""
+        try:
+            f_low  = float(self._bp_low.text())
+            f_high = float(self._bp_high.text())
+            order  = self._bp_order.value()
+            nyq = sr / 2.0
+            if not (0 < f_low < f_high < nyq):
+                return data
+            sos = butter(order, [f_low / nyq, f_high / nyq], btype="band", output="sos")
+            return sosfilt(sos, data)
+        except Exception:
+            return data
+
     # ------------------------------------------------------------------
     # File loading
     # ------------------------------------------------------------------
@@ -292,8 +354,6 @@ class PlotWidget(QWidget):
         self._filepath = filepath
         self._file_edit.setText(filepath)
 
-        # Mark recorded channels in the checkboxes so the user can see
-        # which have data (bold label) vs empty (dimmed)
         try:
             info = get_channel_info(filepath)
             for ch, cb in self._ch_boxes.items():
@@ -324,10 +384,13 @@ class PlotWidget(QWidget):
         self._psd_ax.clear()
 
         nperseg_bits = self._nperseg_spin.value()
-        logx = self._logx_cb.isChecked()
-        logy = self._logy_cb.isChecked()
+        logx  = self._logx_cb.isChecked()
+        logy  = self._logy_cb.isChecked()
+        use_asd     = self._spectrum_combo.currentIndex() == 0
+        use_filter  = self._bp_enable.isChecked()
         fname = Path(self._filepath).name
         sr_label = None
+        last_n = 0
 
         for ch in selected:
             try:
@@ -339,44 +402,67 @@ class PlotWidget(QWidget):
                 continue
 
             sr_label = sr
+            last_n   = len(data)
+
+            # Apply bandpass filter if enabled
+            if use_filter:
+                data = self._apply_bandpass(data, sr)
 
             # Time domain
             t = np.arange(len(data)) / sr
             self._time_ax.plot(t, data, lw=0.6, label=ch, rasterized=True)
 
-            # PSD
+            # Frequency domain
             nperseg = min(2 ** nperseg_bits, len(data))
             f, Pxx = welch(data, fs=sr, nperseg=nperseg)
+
+            # ASD = sqrt(PSD)
+            S = np.sqrt(Pxx) if use_asd else Pxx
+
             f_plot = f[1:] if logx else f
-            P_plot = Pxx[1:] if logx else Pxx
+            S_plot = S[1:] if logx else S
 
             if logx and logy:
-                self._psd_ax.loglog(f_plot, P_plot, lw=0.8, label=ch)
+                self._psd_ax.loglog(f_plot, S_plot, lw=0.8, label=ch)
             elif logx:
-                self._psd_ax.semilogx(f_plot, P_plot, lw=0.8, label=ch)
+                self._psd_ax.semilogx(f_plot, S_plot, lw=0.8, label=ch)
             elif logy:
-                self._psd_ax.semilogy(f_plot, P_plot, lw=0.8, label=ch)
+                self._psd_ax.semilogy(f_plot, S_plot, lw=0.8, label=ch)
             else:
-                self._psd_ax.plot(f_plot, P_plot, lw=0.8, label=ch)
+                self._psd_ax.plot(f_plot, S_plot, lw=0.8, label=ch)
 
         # Decorate time plot
+        filter_note = ""
+        if use_filter:
+            try:
+                fl = float(self._bp_low.text())
+                fh = float(self._bp_high.text())
+                filter_note = f"  [BP {fl:g}–{fh:g} Hz, order {self._bp_order.value()}]"
+            except Exception:
+                pass
+
         self._time_ax.set_xlabel("Time (s)")
         self._time_ax.set_ylabel("Voltage (V)")
         title = fname
         if sr_label:
-            title += f"   {sr_label:g} Hz   {fmt_duration(len(data) / sr_label)}"
+            title += f"   {sr_label:g} Hz   {fmt_duration(last_n / sr_label)}"
+        if filter_note:
+            title += filter_note
         self._time_ax.set_title(title, fontsize=9)
         self._time_ax.grid(True, alpha=0.3)
         if len(selected) > 1:
             self._time_ax.legend(fontsize=8, loc="best")
 
-        # Decorate PSD plot
-        self._psd_ax.set_xlabel("Frequency (Hz)")
-        self._psd_ax.set_ylabel("PSD  (V² / Hz)")
-        nperseg_actual = min(2 ** nperseg_bits, len(data)) if sr_label else 2 ** nperseg_bits
+        # Decorate frequency plot
+        nperseg_actual = min(2 ** nperseg_bits, last_n) if sr_label else 2 ** nperseg_bits
         df = (sr_label / nperseg_actual) if sr_label else 0
+        spectrum_label = "ASD" if use_asd else "PSD"
+        y_unit = "V/√Hz" if use_asd else "V²/Hz"
+        self._psd_ax.set_xlabel("Frequency (Hz)")
+        self._psd_ax.set_ylabel(f"{spectrum_label}  ({y_unit})")
         self._psd_ax.set_title(
-            f"PSD (Welch, 2^{nperseg_bits} = {nperseg_actual:,} pts,  Δf = {df:.3g} Hz)",
+            f"{spectrum_label} (Welch, 2^{nperseg_bits} = {nperseg_actual:,} pts,"
+            f"  Δf = {df:.3g} Hz){filter_note}",
             fontsize=9,
         )
         self._psd_ax.grid(True, alpha=0.3, which="both")
@@ -396,7 +482,7 @@ class PlotWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Layout helper
+# Layout helpers
 # ---------------------------------------------------------------------------
 
 def _plot_panel(title: str, toolbar, canvas) -> QWidget:
