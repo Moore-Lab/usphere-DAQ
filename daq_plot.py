@@ -319,18 +319,32 @@ class PlotWidget(QWidget):
             self._plot()
 
     def _apply_bandpass(self, data: np.ndarray, sr: float) -> np.ndarray:
-        """Return bandpass-filtered data, or original data if filter params are invalid."""
+        """
+        Return bandpass-filtered data.
+        Raises ValueError with a descriptive message if parameters are invalid.
+        """
         try:
             f_low  = float(self._bp_low.text())
             f_high = float(self._bp_high.text())
-            order  = self._bp_order.value()
-            nyq = sr / 2.0
-            if not (0 < f_low < f_high < nyq):
-                return data
-            sos = butter(order, [f_low / nyq, f_high / nyq], btype="band", output="sos")
-            return sosfilt(sos, data)
-        except Exception:
-            return data
+        except ValueError:
+            raise ValueError("Bandpass filter: f low and f high must be numbers.")
+
+        order = self._bp_order.value()
+        nyq   = sr / 2.0
+
+        if f_low <= 0:
+            raise ValueError(f"Bandpass filter: f low must be > 0 (got {f_low}).")
+        if f_high >= nyq:
+            raise ValueError(
+                f"Bandpass filter: f high ({f_high} Hz) must be below Nyquist ({nyq} Hz)."
+            )
+        if f_low >= f_high:
+            raise ValueError(
+                f"Bandpass filter: f low ({f_low}) must be less than f high ({f_high})."
+            )
+
+        sos = butter(order, [f_low / nyq, f_high / nyq], btype="band", output="sos")
+        return sosfilt(sos, data)
 
     # ------------------------------------------------------------------
     # File loading
@@ -406,7 +420,12 @@ class PlotWidget(QWidget):
 
             # Apply bandpass filter if enabled
             if use_filter:
-                data = self._apply_bandpass(data, sr)
+                try:
+                    data = self._apply_bandpass(data, sr)
+                except ValueError as exc:
+                    self._time_ax.set_title(f"Filter error: {exc}", fontsize=9, color="red")
+                    self._time_canvas.draw()
+                    return
 
             # Time domain
             t = np.arange(len(data)) / sr
