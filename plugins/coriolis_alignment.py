@@ -24,6 +24,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -197,6 +198,44 @@ class AlignmentWidget(QWidget):
         self._cb_transverse = QCheckBox("Transverse floor")
         self._cb_transverse.setChecked(False)
         fv.addWidget(self._cb_transverse)
+        self._cb_live_asd = QCheckBox("Live ASD")
+        self._cb_live_asd.setChecked(True)
+        fv.addWidget(self._cb_live_asd)
+
+        # Live ASD settings row
+        live_cfg = QHBoxLayout()
+        live_cfg.addWidget(QLabel("Last N files:"))
+        self._live_n_spin = QSpinBox()
+        self._live_n_spin.setRange(1, 100)
+        self._live_n_spin.setValue(3)
+        self._live_n_spin.setMaximumWidth(60)
+        live_cfg.addWidget(self._live_n_spin)
+        self._cb_enc_accel = QCheckBox("Encoder accel")
+        self._cb_enc_accel.setChecked(True)
+        live_cfg.addWidget(self._cb_enc_accel)
+        live_cfg.addStretch()
+        fv.addLayout(live_cfg)
+
+        # Frequency range row
+        freq_cfg = QHBoxLayout()
+        freq_cfg.addWidget(QLabel("f range (Hz):"))
+        self._flo_spin = QDoubleSpinBox()
+        self._flo_spin.setRange(0.0, 1000.0)
+        self._flo_spin.setValue(0.1)
+        self._flo_spin.setDecimals(2)
+        self._flo_spin.setSingleStep(0.1)
+        self._flo_spin.setMaximumWidth(70)
+        freq_cfg.addWidget(self._flo_spin)
+        freq_cfg.addWidget(QLabel("–"))
+        self._fhi_spin = QDoubleSpinBox()
+        self._fhi_spin.setRange(0.0, 10000.0)
+        self._fhi_spin.setValue(20.0)
+        self._fhi_spin.setDecimals(2)
+        self._fhi_spin.setSingleStep(1.0)
+        self._fhi_spin.setMaximumWidth(70)
+        freq_cfg.addWidget(self._fhi_spin)
+        freq_cfg.addStretch()
+        fv.addLayout(freq_cfg)
 
         # Axis selector
         ax_row = QHBoxLayout()
@@ -524,7 +563,7 @@ class AlignmentWidget(QWidget):
 
         ax_top.axhline(noise_floor_g, color='k', ls=':', lw=1.0, alpha=0.7,
                        label=f'Spec @ 2 Hz: {noise_spec_ug} µg/√Hz')
-        ax_top.set_xlim(0.1, 20)
+        ax_top.set_xlim(self._flo_spin.value(), self._fhi_spin.value())
         ax_top.set_ylabel('Accel ASD  [g/√Hz]')
         ax_top.set_title(
             f'{label} {axis.upper()} — solid: accelerometer, dashed: enc-derived',
@@ -533,7 +572,7 @@ class AlignmentWidget(QWidget):
         ax_top.legend(fontsize=7, ncol=2)
         ax_top.grid(True, which='both', ls=':')
 
-        ax_bot.set_xlim(0.1, 20)
+        ax_bot.set_xlim(self._flo_spin.value(), self._fhi_spin.value())
         ax_bot.set_ylabel('Position ASD  [mm/√Hz]')
         ax_bot.set_title(f'{label} {axis.upper()} — encoder position', fontsize=10)
         ax_bot.set_xlabel('Frequency (Hz)')
@@ -610,9 +649,96 @@ class AlignmentWidget(QWidget):
             )
             ax.set_xlabel('Frequency (Hz)')
             ax.set_ylabel('ASD  [g/√Hz]')
-            ax.set_xlim(0.1, 20)
+            ax.set_xlim(self._flo_spin.value(), self._fhi_spin.value())
             ax.legend(fontsize=8)
             ax.grid(True, which='both', ls=':')
+
+        self._add_figure(fig)
+
+    # ------------------------------------------------------------------
+    # Live ASD plot (last N files, accel + encoder-derived on one axis)
+    # ------------------------------------------------------------------
+
+    _LIVE_KEEP = 3  # default, overridden by spinbox
+
+    def _plot_live_asd(self, records: list[dict], label: str):
+        """Single-panel ASD: accelerometer and encoder-derived accel overlaid.
+
+        Shows only the most recent N files (from spinbox).  Computes RMS in
+        0–20 Hz for each trace and annotates it on the plot.
+        """
+        n_keep = self._live_n_spin.value()
+        show_enc = self._cb_enc_accel.isChecked()
+        recent = records[-n_keep:]
+        if not recent:
+            return
+
+        sensitivity = self._hwf("sensitivity", 1000.0)
+        mm_per_V = self._mm_per_V()
+        nseg_bits = self._nseg_spin.value()
+        noise_spec_ug = 0.03
+
+        fig = Figure(figsize=(10, 5), tight_layout=True)
+        ax = fig.add_subplot(1, 1, 1)
+
+        colors = ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+        rms_lines: list[str] = []
+        f_lo = self._flo_spin.value()
+        f_hi = self._fhi_spin.value()
+
+        for i, rec in enumerate(recent):
+            color = colors[i % len(colors)]
+            fs = rec['fs']
+            nperseg = min(2 ** nseg_bits, len(rec['accel_V']))
+
+            f, Pxx_a = welch(rec['accel_V'] - rec['accel_V'].mean(),
+                             fs=fs, nperseg=nperseg)
+            _, Pxx_e = welch(rec['encoder_V'] - rec['encoder_V'].mean(),
+                             fs=fs, nperseg=nperseg)
+
+            asd_a_g = np.sqrt(Pxx_a) / sensitivity
+            asd_e_mm = np.sqrt(Pxx_e) * mm_per_V
+            asd_enc_g = self._encoder_asd_to_accel_g(f, asd_e_mm)
+
+            # RMS in [f_lo, f_hi]: sqrt( integral ASD² df )
+            df = f[1] - f[0] if len(f) > 1 else 1.0
+            band = (f >= f_lo) & (f <= f_hi)
+            rms_accel = np.sqrt(np.sum(asd_a_g[band]**2) * df)
+            rms_enc   = np.sqrt(np.sum(asd_enc_g[band]**2) * df)
+
+            lbl = self._file_label(rec)
+            ax.plot(f, asd_a_g, lw=0.9, color=color, label=f'{lbl} accel')
+            if show_enc:
+                ax.plot(f, asd_enc_g, lw=0.9, color=color, ls='--',
+                        label=f'{lbl} enc')
+
+            if show_enc:
+                rms_lines.append(
+                    f"{lbl}:  accel {rms_accel:.3e} g   enc {rms_enc:.3e} g"
+                )
+            else:
+                rms_lines.append(
+                    f"{lbl}:  accel {rms_accel:.3e} g"
+                )
+
+        # Reference noise floor
+        ax.axhline(noise_spec_ug * 1e-6, color='k', ls=':', lw=1.0, alpha=0.7,
+                   label=f'Spec: {noise_spec_ug} µg/√Hz')
+
+        ax.set_xlim(f_lo, f_hi)
+        ax.set_xlabel('Frequency (Hz)')
+        ax.set_ylabel('Accel ASD  [g/√Hz]')
+        ax.set_title(f'{label} — solid: accelerometer, dashed: encoder-derived',
+                     fontsize=10)
+        ax.legend(fontsize=7, ncol=2, loc='upper right')
+        ax.grid(True, which='both', ls=':')
+
+        # RMS annotation box
+        rms_text = f'RMS ({f_lo:g}–{f_hi:g} Hz):\n' + '\n'.join(rms_lines)
+        ax.text(0.02, 0.02, rms_text, transform=ax.transAxes,
+                fontsize=8, verticalalignment='bottom',
+                fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.4', fc='white', alpha=0.85))
 
         self._add_figure(fig)
 
@@ -659,7 +785,12 @@ class AlignmentWidget(QWidget):
             axis = rec['axis']
             label = "live"
 
+            # For non-live-ASD flags, filter records to matching axis
+            axis_records = [r for r in self._records if r['axis'] == axis]
+
             self._clear_plots()
+            if self._cb_live_asd.isChecked():
+                self._plot_live_asd(axis_records, label)
             if self._cb_raw_ts.isChecked():
                 self._plot_raw_ts(axis, label)
             if self._cb_cal_ts.isChecked():
