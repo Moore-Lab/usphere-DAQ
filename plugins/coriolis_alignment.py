@@ -240,6 +240,21 @@ class AlignmentWidget(QWidget):
         freq_cfg.addStretch()
         fv.addLayout(freq_cfg)
 
+        # Persistent reference lines
+        line_row = QHBoxLayout()
+        line_row.addWidget(QLabel("hlines:"))
+        self._hline_edit = QLineEdit()
+        self._hline_edit.setPlaceholderText("e.g. 1e-4, 3e-5")
+        self._hline_edit.setMaximumWidth(160)
+        line_row.addWidget(self._hline_edit)
+        line_row.addWidget(QLabel("vlines:"))
+        self._vline_edit = QLineEdit()
+        self._vline_edit.setPlaceholderText("e.g. 2.0, 10.5")
+        self._vline_edit.setMaximumWidth(160)
+        line_row.addWidget(self._vline_edit)
+        line_row.addStretch()
+        fv.addLayout(line_row)
+
         # Axis selector
         ax_row = QHBoxLayout()
         ax_row.addWidget(QLabel("Axis:"))
@@ -432,10 +447,36 @@ class AlignmentWidget(QWidget):
 
     def _add_figure(self, fig):
         """Add a matplotlib Figure to the scrollable plot area."""
+        # Draw persistent reference lines on every axes
+        self._apply_ref_lines(fig)
         canvas = FigureCanvasQTAgg(fig)
         toolbar = NavigationToolbar2QT(canvas, self)
         self._plot_layout.addWidget(toolbar)
         self._plot_layout.addWidget(canvas)
+
+    def _parse_line_values(self, text: str) -> list[float]:
+        """Parse comma-separated numbers, silently skipping bad entries."""
+        vals: list[float] = []
+        for tok in text.split(','):
+            tok = tok.strip()
+            if tok:
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    pass
+        return vals
+
+    def _apply_ref_lines(self, fig):
+        """Draw user-specified hlines / vlines on all axes of *fig*."""
+        hvals = self._parse_line_values(self._hline_edit.text())
+        vvals = self._parse_line_values(self._vline_edit.text())
+        if not hvals and not vvals:
+            return
+        for ax in fig.get_axes():
+            for h in hvals:
+                ax.axhline(h, color='red', ls='-', lw=1.0, alpha=0.7)
+            for v in vvals:
+                ax.axvline(v, color='blue', ls='-', lw=1.0, alpha=0.7)
 
     def _clear_plots(self):
         while self._plot_layout.count():
