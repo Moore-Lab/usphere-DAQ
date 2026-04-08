@@ -47,10 +47,23 @@ from matplotlib.figure import Figure
 
 from plugins.base import AnalysisPlugin
 
-# Ensure Microsphere-Utility-Scripts is importable
+# Resolve the external script explicitly to avoid name collision with this file.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "Microsphere-Utility-Scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
+_CA_MODULE_PATH = _SCRIPTS_DIR / "coriolis_alignment.py"
+
+
+def _get_ca_module():
+    """Import Microsphere-Utility-Scripts/coriolis_alignment.py by file path."""
+    import importlib.util
+    # Add scripts dir to sys.path so coriolis_alignment's own imports work
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "_ext_coriolis_alignment", str(_CA_MODULE_PATH),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +82,13 @@ class _LoadWorker(QThread):
 
     def run(self):
         try:
-            from coriolis_alignment import load_dataset, ACCEL_COL, ENCODER_COL
+            ca = _get_ca_module()
             # Temporarily override column constants
-            import coriolis_alignment as ca
             orig_a, orig_e = ca.ACCEL_COL, ca.ENCODER_COL
             ca.ACCEL_COL = self.accel_col
             ca.ENCODER_COL = self.encoder_col
             try:
-                records = load_dataset(self.data_dir)
+                records = ca.load_dataset(self.data_dir)
             finally:
                 ca.ACCEL_COL = orig_a
                 ca.ENCODER_COL = orig_e
@@ -612,12 +624,12 @@ class AlignmentWidget(QWidget):
             return
 
         try:
-            from coriolis_alignment import parse_filename
+            ca = _get_ca_module()
             from daq_h5 import read_channel
 
             fname = Path(filepath).name
             try:
-                meta = parse_filename(fname)
+                meta = ca.parse_filename(fname)
             except Exception:
                 # File doesn't follow the expected naming convention — skip
                 return
