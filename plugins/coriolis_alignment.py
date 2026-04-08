@@ -405,7 +405,9 @@ class AlignmentWidget(QWidget):
     def _file_label(self, rec):
         if rec['kind'] == 'sine':
             return f"{rec['amp_mm']:.1f} mm @ {rec['freq_hz']:.0f} Hz"
-        return 'noise'
+        if rec['kind'] == 'noise':
+            return 'noise'
+        return rec.get('fname', 'data')
 
     # ------------------------------------------------------------------
     # Plotting
@@ -628,11 +630,12 @@ class AlignmentWidget(QWidget):
             from daq_h5 import read_channel
 
             fname = Path(filepath).name
+            # Try the structured naming convention; fall back to generic
             try:
                 meta = ca.parse_filename(fname)
             except Exception:
-                # File doesn't follow the expected naming convention — skip
-                return
+                meta = {'axis': self._axis_combo.currentText(),
+                        'kind': 'data', 'amp_mm': None, 'freq_hz': None}
 
             accel_col = self._hwi("accel_col", 16)
             encoder_col = self._hwi("encoder_col", 17)
@@ -652,8 +655,8 @@ class AlignmentWidget(QWidget):
             self._live_lbl.setText(f"{len(self._records)} file(s)")
             self._log(f"Live: {fname}")
 
-            # Re-plot with selected flags
-            axis = self._axis_combo.currentText()
+            # Re-plot with selected flags — use the record's axis
+            axis = rec['axis']
             label = "live"
 
             self._clear_plots()
