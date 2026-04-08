@@ -10,11 +10,13 @@ File structure
 --------------
     beads/
       data/
-        pos_data   shape (N_STREAMS × n_samples)  float64
+        pos_data   shape (N_STREAMS × n_samples)  int16 (ADC counts)
           attrs:
             schema_version   int
             Fsamp            float64   sample rate (Hz)
             Time             float64   Unix timestamp at file start
+            voltage_min      float64   lower voltage rail (V)
+            voltage_max      float64   upper voltage rail (V)
 
         FPGA         shape (0,)  — FPGA module data
           attrs: one key per FPGA control (e.g. "Dg X", "Ig X", ...)
@@ -52,7 +54,9 @@ import numpy as np
 # Schema version
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 3
+
+ADC_BITS: int = 16
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +78,26 @@ ALL_CHANNELS: list[str] = [f"ai{i}" for i in range(N_STREAMS)]
 # Writer
 # ---------------------------------------------------------------------------
 
+def volts_to_counts(volts: np.ndarray, voltage_min: float, voltage_max: float) -> np.ndarray:
+    """Convert voltage array to 16-bit ADC counts (int16)."""
+    lsb = (voltage_max - voltage_min) / (2 ** ADC_BITS)
+    counts = np.round(volts / lsb).clip(-32768, 32767).astype(np.int16)
+    return counts
+
+
+def counts_to_volts(counts: np.ndarray, voltage_min: float, voltage_max: float) -> np.ndarray:
+    """Convert 16-bit ADC counts back to voltage."""
+    lsb = (voltage_max - voltage_min) / (2 ** ADC_BITS)
+    return counts.astype(np.float64) * lsb
+
+
 def write(
     filepath: str | Path,
     channel_data: dict[str, np.ndarray],
     n_samples: int,
     fsamp: float,
+    voltage_min: float = -10.0,
+    voltage_max: float = 10.0,
     module_data: dict[str, dict] | None = None,
 ) -> None:
     """
@@ -87,24 +106,26 @@ def write(
     Parameters
     ----------
     filepath      : destination path
-    channel_data  : {channel_name: 1-D array} — only recorded channels needed
+    channel_data  : {channel_name: 1-D array of volts} — only recorded channels needed
     n_samples     : samples per channel (= 2 ** n_bits)
     fsamp         : sample rate in Hz
+    voltage_min   : lower voltage rail (V), default -10.0
+    voltage_max   : upper voltage rail (V), default  10.0
     module_data   : {module_name: {attr_name: value}}
                     Each module is written as a separate dataset under beads/data/.
                     Missing or None → no module datasets written.
     """
     import time as _time
 
-    pos_data = np.zeros((N_STREAMS, n_samples), dtype=np.float64)
+    pos_data = np.zeros((N_STREAMS, n_samples), dtype=np.int16)
     for i, ch in enumerate(ALL_CHANNELS):
         if ch in channel_data:
-            pos_data[i] = channel_data[ch]
+            pos_data[i] = volts_to_counts(channel_data[ch], voltage_min, voltage_max)
 
     with h5py.File(filepath, "w") as f:
         grp = f.require_group("beads/data")
 
-        # Main ADC data
+        # Main ADC data — stored as int16 ADC counts
         ds = grp.create_dataset(
             "pos_data",
             data=pos_data,
@@ -114,6 +135,8 @@ def write(
         ds.attrs["schema_version"] = SCHEMA_VERSION
         ds.attrs["Fsamp"]          = float(fsamp)
         ds.attrs["Time"]           = _time.time()
+        ds.attrs["voltage_min"]    = float(voltage_min)
+        ds.attrs["voltage_max"]    = float(voltage_max)
 
         # One dataset per module — empty array, all data in attrs
         if module_data:
@@ -147,7 +170,9 @@ def read_channel(
     channel: str,
 ) -> tuple[np.ndarray, float]:
     """
-    Return (data_array, sample_rate_hz) for one channel (row).
+    Return (data_array_in_volts, sample_rate_hz) for one channel (row).
+
+    Handles both schema v3 (int16 ADC counts) and v2 (float64 volts).
 
     Raises
     ------
@@ -158,19 +183,29 @@ def read_channel(
     idx = ALL_CHANNELS.index(channel)
     with h5py.File(filepath, "r") as f:
         ds = f[DATASET_PATH]
-        data = ds[idx, :]
+        raw = ds[idx, :]
         fsamp = float(ds.attrs["Fsamp"])
+        # Schema v3+: int16 ADC counts → convert to volts
+        if raw.dtype == np.int16:
+            vmin = float(ds.attrs.get("voltage_min", -10.0))
+            vmax = float(ds.attrs.get("voltage_max",  10.0))
+            data = counts_to_volts(raw, vmin, vmax)
+        else:
+            # Schema v2: already float64 volts
+            data = raw.astype(np.float64)
     return data, fsamp
 
 
 def read_attrs(filepath: str | Path) -> dict:
-    """Return pos_data fixed attributes (schema_version, Fsamp, Time)."""
+    """Return pos_data fixed attributes (schema_version, Fsamp, Time, voltage range)."""
     with h5py.File(filepath, "r") as f:
         ds = f[DATASET_PATH]
         return {
             "schema_version": int(ds.attrs.get("schema_version", 0)),
             "Fsamp": float(ds.attrs.get("Fsamp", 0.0)),
             "Time":  float(ds.attrs.get("Time",  0.0)),
+            "voltage_min": float(ds.attrs.get("voltage_min", -10.0)),
+            "voltage_max": float(ds.attrs.get("voltage_max",  10.0)),
         }
 
 

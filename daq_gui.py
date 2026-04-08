@@ -235,6 +235,101 @@ class _RecorderSignals(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Plugin manager widget
+# ---------------------------------------------------------------------------
+
+class PluginManagerWidget(QWidget):
+    """Lists discovered analysis plugins with Load / Unload controls."""
+
+    def __init__(self, tabs: QTabWidget, parent=None):
+        super().__init__(parent)
+        self._tabs = tabs
+        self._loaded: dict[str, tuple[object, QWidget]] = {}   # name → (plugin, widget)
+        self._buttons: dict[str, QPushButton] = {}
+        self._available: list = []
+
+        try:
+            from plugins import discover_plugins
+            self._available = discover_plugins()
+        except Exception as exc:
+            print(f"[plugins] Discovery failed: {exc}")
+
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        header = QLabel(
+            "<b>Analysis Plugins</b><br>"
+            "<span style='color:gray; font-size:10px;'>"
+            "Load a plugin to add its analysis tab to the GUI.</span>"
+        )
+        layout.addWidget(header)
+
+        if not self._available:
+            layout.addWidget(QLabel("No plugins found in the <code>plugins/</code> directory."))
+            layout.addStretch()
+            return
+
+        for cls in self._available:
+            box = QGroupBox(cls.NAME)
+            row = QHBoxLayout(box)
+            desc = QLabel(cls.DESCRIPTION)
+            desc.setWordWrap(True)
+            row.addWidget(desc, stretch=1)
+
+            btn = QPushButton("Load")
+            btn.setMinimumWidth(80)
+            btn.clicked.connect(lambda _c, c=cls: self._toggle(c))
+            self._buttons[cls.NAME] = btn
+            row.addWidget(btn)
+
+            layout.addWidget(box)
+
+        layout.addStretch()
+
+    # ------------------------------------------------------------------
+
+    def _toggle(self, cls):
+        if cls.NAME in self._loaded:
+            self._unload(cls.NAME)
+        else:
+            self._load(cls)
+
+    def _load(self, cls):
+        plugin = cls()
+        widget = plugin.create_widget()
+        self._tabs.addTab(widget, plugin.NAME)
+        self._loaded[plugin.NAME] = (plugin, widget)
+        self._buttons[plugin.NAME].setText("Unload")
+        self._buttons[plugin.NAME].setStyleSheet(
+            "QPushButton { background-color: #c0392b; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #e74c3c; }"
+        )
+        self._tabs.setCurrentWidget(widget)
+
+    def _unload(self, name):
+        plugin, widget = self._loaded.pop(name)
+        idx = self._tabs.indexOf(widget)
+        if idx >= 0:
+            self._tabs.removeTab(idx)
+        plugin.teardown()
+        widget.deleteLater()
+        self._buttons[name].setText("Load")
+        self._buttons[name].setStyleSheet("")
+
+    def notify_file_written(self, filepath: str):
+        """Forward to every loaded plugin."""
+        for plugin, _widget in self._loaded.values():
+            try:
+                plugin.on_file_written(filepath)
+            except Exception as exc:
+                print(f"[plugin] {plugin.NAME}: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # NI PXIe-6363 discrete input ranges
 # DAQmx selects the smallest range that contains (min_val, max_val).
 # Presenting only the exact hardware ranges avoids silent rounding.
@@ -287,6 +382,7 @@ class MainWindow(QMainWindow):
         vbox.setContentsMargins(6, 6, 6, 6)
 
         tabs = QTabWidget()
+        self._tabs = tabs
         vbox.addWidget(tabs)
 
         # --- Tab 1: Acquire ---
@@ -307,7 +403,11 @@ class MainWindow(QMainWindow):
         self._modules_tab = ModulesWidget()
         tabs.addTab(self._modules_tab, "Modules")
 
-        # --- Tab 3: Plot ---
+        # --- Tab 3: Plugins ---
+        self._plugins_tab = PluginManagerWidget(tabs)
+        tabs.addTab(self._plugins_tab, "Plugins")
+
+        # --- Tab 4: Plot ---
         self._plot_tab = PlotWidget()
         tabs.addTab(self._plot_tab, "Plot")
 
@@ -591,6 +691,7 @@ class MainWindow(QMainWindow):
         self._files_written += 1
         self._files_lbl.setText(f"Files written this session: {self._files_written}")
         self._plot_tab.load_file(path)  # keep plot tab pointed at the latest file
+        self._plugins_tab.notify_file_written(path)  # forward to loaded plugins
 
     def _on_recording_finished(self):
         self._apply_btn_style(running=False)

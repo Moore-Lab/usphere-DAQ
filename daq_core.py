@@ -210,6 +210,8 @@ class DAQRecorder:
             channel_data=data,
             n_samples=cfg.n_samples,
             fsamp=cfg.sample_rate,
+            voltage_min=cfg.voltage_min,
+            voltage_max=cfg.voltage_max,
             module_data=module_data,
         )
 
