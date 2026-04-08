@@ -540,6 +540,10 @@ class AlignmentWidget(QWidget):
         ax_bot = fig.add_subplot(2, 1, 2)
 
         colors = ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+        psd_flo = self._flo_spin.value()
+        psd_fhi = self._fhi_spin.value()
+        y_max_top: list[float] = []
+        y_max_bot: list[float] = []
 
         for i, rec in enumerate(subset):
             color = colors[i % len(colors)]
@@ -555,6 +559,12 @@ class AlignmentWidget(QWidget):
             asd_e_mm = np.sqrt(Pxx_e) * mm_per_V
             asd_enc_g = self._encoder_asd_to_accel_g(f, asd_e_mm)
 
+            band = (f >= psd_flo) & (f <= psd_fhi)
+            if np.any(band):
+                y_max_top.append(float(np.max(asd_a_g[band])))
+                y_max_top.append(float(np.max(asd_enc_g[band])))
+                y_max_bot.append(float(np.max(asd_e_mm[band])))
+
             lbl = self._file_label(rec)
             ax_top.plot(f, asd_a_g, lw=0.9, color=color, label=f'{lbl} [accel]')
             ax_top.plot(f, asd_enc_g, lw=0.9, color=color, ls='--',
@@ -563,7 +573,9 @@ class AlignmentWidget(QWidget):
 
         ax_top.axhline(noise_floor_g, color='k', ls=':', lw=1.0, alpha=0.7,
                        label=f'Spec @ 2 Hz: {noise_spec_ug} µg/√Hz')
-        ax_top.set_xlim(self._flo_spin.value(), self._fhi_spin.value())
+        ax_top.set_xlim(psd_flo, psd_fhi)
+        if y_max_top:
+            ax_top.set_ylim(0, max(y_max_top) * 1.15)
         ax_top.set_ylabel('Accel ASD  [g/√Hz]')
         ax_top.set_title(
             f'{label} {axis.upper()} — solid: accelerometer, dashed: enc-derived',
@@ -572,7 +584,9 @@ class AlignmentWidget(QWidget):
         ax_top.legend(fontsize=7, ncol=2)
         ax_top.grid(True, which='both', ls=':')
 
-        ax_bot.set_xlim(self._flo_spin.value(), self._fhi_spin.value())
+        ax_bot.set_xlim(psd_flo, psd_fhi)
+        if y_max_bot:
+            ax_bot.set_ylim(0, max(y_max_bot) * 1.15)
         ax_bot.set_ylabel('Position ASD  [mm/√Hz]')
         ax_bot.set_title(f'{label} {axis.upper()} — encoder position', fontsize=10)
         ax_bot.set_xlabel('Frequency (Hz)')
@@ -649,7 +663,17 @@ class AlignmentWidget(QWidget):
             )
             ax.set_xlabel('Frequency (Hz)')
             ax.set_ylabel('ASD  [g/√Hz]')
-            ax.set_xlim(self._flo_spin.value(), self._fhi_spin.value())
+            t_flo, t_fhi = self._flo_spin.value(), self._fhi_spin.value()
+            ax.set_xlim(t_flo, t_fhi)
+            # Auto-scale ylim to visible data
+            band_t = (f_y >= t_flo) & (f_y <= t_fhi)
+            if np.any(band_t):
+                y_vis = [float(np.max(asd_y[band_t]))]
+                if asd_x_i is not None:
+                    y_vis.append(float(np.max((trans_sens * asd_x_i)[band_t])))
+                if asd_z_i is not None:
+                    y_vis.append(float(np.max((trans_sens * asd_z_i)[band_t])))
+                ax.set_ylim(0, max(y_vis) * 1.15)
             ax.legend(fontsize=8)
             ax.grid(True, which='both', ls=':')
 
@@ -685,6 +709,7 @@ class AlignmentWidget(QWidget):
         rms_lines: list[str] = []
         f_lo = self._flo_spin.value()
         f_hi = self._fhi_spin.value()
+        y_maxes: list[float] = []
 
         for i, rec in enumerate(recent):
             color = colors[i % len(colors)]
@@ -706,6 +731,12 @@ class AlignmentWidget(QWidget):
             rms_accel = np.sqrt(np.sum(asd_a_g[band]**2) * df)
             rms_enc   = np.sqrt(np.sum(asd_enc_g[band]**2) * df)
 
+            # Track max visible y for auto-scaling
+            if np.any(band):
+                y_maxes.append(float(np.max(asd_a_g[band])))
+                if show_enc:
+                    y_maxes.append(float(np.max(asd_enc_g[band])))
+
             lbl = self._file_label(rec)
             ax.plot(f, asd_a_g, lw=0.9, color=color, label=f'{lbl} accel')
             if show_enc:
@@ -726,6 +757,8 @@ class AlignmentWidget(QWidget):
                    label=f'Spec: {noise_spec_ug} µg/√Hz')
 
         ax.set_xlim(f_lo, f_hi)
+        if y_maxes:
+            ax.set_ylim(0, max(y_maxes) * 1.15)
         ax.set_xlabel('Frequency (Hz)')
         ax.set_ylabel('Accel ASD  [g/√Hz]')
         ax.set_title(f'{label} — solid: accelerometer, dashed: encoder-derived',
