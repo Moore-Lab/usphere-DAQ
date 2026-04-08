@@ -562,7 +562,6 @@ class AlignmentWidget(QWidget):
             band = (f >= psd_flo) & (f <= psd_fhi)
             if np.any(band):
                 y_max_top.append(float(np.max(asd_a_g[band])))
-                y_max_top.append(float(np.max(asd_enc_g[band])))
                 y_max_bot.append(float(np.max(asd_e_mm[band])))
 
             lbl = self._file_label(rec)
@@ -734,8 +733,6 @@ class AlignmentWidget(QWidget):
             # Track max visible y for auto-scaling
             if np.any(band):
                 y_maxes.append(float(np.max(asd_a_g[band])))
-                if show_enc:
-                    y_maxes.append(float(np.max(asd_enc_g[band])))
 
             lbl = self._file_label(rec)
             ax.plot(f, asd_a_g, lw=0.9, color=color, label=f'{lbl} accel')
