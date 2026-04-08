@@ -201,6 +201,9 @@ class AlignmentWidget(QWidget):
         self._cb_live_asd = QCheckBox("Live ASD")
         self._cb_live_asd.setChecked(True)
         fv.addWidget(self._cb_live_asd)
+        self._cb_live_cal_ts = QCheckBox("Live cal TS")
+        self._cb_live_cal_ts.setChecked(False)
+        fv.addWidget(self._cb_live_cal_ts)
 
         # Live ASD settings row
         live_cfg = QHBoxLayout()
@@ -773,6 +776,53 @@ class AlignmentWidget(QWidget):
         self._add_figure(fig)
 
     # ------------------------------------------------------------------
+    # Live calibrated time series (last N files, accel + optional encoder)
+    # ------------------------------------------------------------------
+
+    def _plot_live_cal_ts(self, records: list[dict], label: str):
+        """Calibrated time series: accelerometer (and optionally encoder-derived)
+        acceleration overlaid for the most recent N files."""
+        n_keep = self._live_n_spin.value()
+        show_enc = self._cb_enc_accel.isChecked()
+        recent = records[-n_keep:]
+        if not recent:
+            return
+
+        thin = 5
+        fig = Figure(figsize=(10, 3 * len(recent)), tight_layout=True)
+        colors = ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+
+        for i, rec in enumerate(recent):
+            color = colors[i % len(colors)]
+            ax = fig.add_subplot(len(recent), 1, i + 1)
+
+            t = rec['t'][::thin]
+            a_g = self._to_accel_g(rec['accel_V'])[::thin]
+            ax.plot(t, a_g, lw=0.5, color=color, label='accel')
+
+            if show_enc:
+                enc_g = self._encoder_to_accel_g_td(
+                    rec['encoder_V'], rec['fs']
+                )[::thin]
+                ax.plot(t, enc_g, lw=0.5, color=color, ls='--',
+                        label='enc-derived')
+
+            # Scale y-axis to accelerometer data only
+            a_min, a_max = float(np.min(a_g)), float(np.max(a_g))
+            margin = (a_max - a_min) * 0.1 or 1e-6
+            ax.set_ylim(a_min - margin, a_max + margin)
+
+            ax.set_ylabel('accel (g)')
+            ax.set_title(self._file_label(rec), fontsize=9)
+            ax.legend(fontsize=7, loc='upper right')
+            ax.grid(True, ls=':')
+            if i == len(recent) - 1:
+                ax.set_xlabel('Time (s)')
+
+        fig.suptitle(f'{label} — calibrated time series', fontsize=11)
+        self._add_figure(fig)
+
+    # ------------------------------------------------------------------
     # Live mode
     # ------------------------------------------------------------------
 
@@ -821,6 +871,8 @@ class AlignmentWidget(QWidget):
             self._clear_plots()
             if self._cb_live_asd.isChecked():
                 self._plot_live_asd(axis_records, label)
+            if self._cb_live_cal_ts.isChecked():
+                self._plot_live_cal_ts(axis_records, label)
             if self._cb_raw_ts.isChecked():
                 self._plot_raw_ts(axis, label)
             if self._cb_cal_ts.isChecked():
