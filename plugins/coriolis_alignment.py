@@ -781,7 +781,7 @@ class AlignmentWidget(QWidget):
 
     def _plot_live_cal_ts(self, records: list[dict], label: str):
         """Calibrated time series: accelerometer (and optionally encoder-derived)
-        acceleration overlaid for the most recent N files."""
+        acceleration concatenated on a single axis as a rolling view."""
         n_keep = self._live_n_spin.value()
         show_enc = self._cb_enc_accel.isChecked()
         recent = records[-n_keep:]
@@ -789,37 +789,47 @@ class AlignmentWidget(QWidget):
             return
 
         thin = 5
-        fig = Figure(figsize=(10, 3 * len(recent)), tight_layout=True)
+        fig = Figure(figsize=(10, 4), tight_layout=True)
+        ax = fig.add_subplot(1, 1, 1)
         colors = ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']
+
+        t_offset = 0.0
+        all_a_g: list[np.ndarray] = []
 
         for i, rec in enumerate(recent):
             color = colors[i % len(colors)]
-            ax = fig.add_subplot(len(recent), 1, i + 1)
-
-            t = rec['t'][::thin]
+            t = rec['t'][::thin] + t_offset
             a_g = self._to_accel_g(rec['accel_V'])[::thin]
-            ax.plot(t, a_g, lw=0.5, color=color, label='accel')
+            all_a_g.append(a_g)
+
+            ax.plot(t, a_g, lw=0.5, color=color, label=f'{self._file_label(rec)} accel')
 
             if show_enc:
                 enc_g = self._encoder_to_accel_g_td(
                     rec['encoder_V'], rec['fs']
                 )[::thin]
                 ax.plot(t, enc_g, lw=0.5, color=color, ls='--',
-                        label='enc-derived')
+                        label=f'{self._file_label(rec)} enc')
 
-            # Scale y-axis to accelerometer data only
-            a_min, a_max = float(np.min(a_g)), float(np.max(a_g))
-            margin = (a_max - a_min) * 0.1 or 1e-6
-            ax.set_ylim(a_min - margin, a_max + margin)
+            # Vertical separator between files
+            if i > 0:
+                ax.axvline(t_offset, color='gray', ls='--', lw=0.6, alpha=0.5)
 
-            ax.set_ylabel('accel (g)')
-            ax.set_title(self._file_label(rec), fontsize=9)
-            ax.legend(fontsize=7, loc='upper right')
-            ax.grid(True, ls=':')
-            if i == len(recent) - 1:
-                ax.set_xlabel('Time (s)')
+            t_offset = float(t[-1]) + (t[1] - t[0]) if len(t) > 1 else t_offset + 1.0
 
-        fig.suptitle(f'{label} — calibrated time series', fontsize=11)
+        # Scale y-axis to accelerometer data only
+        concat = np.concatenate(all_a_g)
+        a_min, a_max = float(np.min(concat)), float(np.max(concat))
+        margin = (a_max - a_min) * 0.1 or 1e-6
+        ax.set_ylim(a_min - margin, a_max + margin)
+
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('accel (g)')
+        ax.set_title(f'{label} — calibrated time series (last {len(recent)} files)',
+                     fontsize=10)
+        ax.legend(fontsize=7, ncol=2, loc='upper right')
+        ax.grid(True, ls=':')
+
         self._add_figure(fig)
 
     # ------------------------------------------------------------------
