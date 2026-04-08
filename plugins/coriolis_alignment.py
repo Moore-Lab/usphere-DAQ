@@ -255,6 +255,17 @@ class AlignmentWidget(QWidget):
         line_row.addStretch()
         fv.addLayout(line_row)
 
+        # Log scale toggles
+        log_row = QHBoxLayout()
+        self._cb_xlog = QCheckBox("x log")
+        self._cb_xlog.setChecked(False)
+        log_row.addWidget(self._cb_xlog)
+        self._cb_ylog = QCheckBox("y log")
+        self._cb_ylog.setChecked(False)
+        log_row.addWidget(self._cb_ylog)
+        log_row.addStretch()
+        fv.addLayout(log_row)
+
         # Axis selector
         ax_row = QHBoxLayout()
         ax_row.addWidget(QLabel("Axis:"))
@@ -617,8 +628,12 @@ class AlignmentWidget(QWidget):
         ax_top.axhline(noise_floor_g, color='k', ls=':', lw=1.0, alpha=0.7,
                        label=f'Spec @ 2 Hz: {noise_spec_ug} µg/√Hz')
         ax_top.set_xlim(psd_flo, psd_fhi)
-        if y_max_top:
+        if self._cb_ylog.isChecked():
+            ax_top.set_yscale('log')
+        elif y_max_top:
             ax_top.set_ylim(0, max(y_max_top) * 1.15)
+        if self._cb_xlog.isChecked():
+            ax_top.set_xscale('log')
         ax_top.set_ylabel('Accel ASD  [g/√Hz]')
         ax_top.set_title(
             f'{label} {axis.upper()} — solid: accelerometer, dashed: enc-derived',
@@ -628,8 +643,12 @@ class AlignmentWidget(QWidget):
         ax_top.grid(True, which='both', ls=':')
 
         ax_bot.set_xlim(psd_flo, psd_fhi)
-        if y_max_bot:
+        if self._cb_ylog.isChecked():
+            ax_bot.set_yscale('log')
+        elif y_max_bot:
             ax_bot.set_ylim(0, max(y_max_bot) * 1.15)
+        if self._cb_xlog.isChecked():
+            ax_bot.set_xscale('log')
         ax_bot.set_ylabel('Position ASD  [mm/√Hz]')
         ax_bot.set_title(f'{label} {axis.upper()} — encoder position', fontsize=10)
         ax_bot.set_xlabel('Frequency (Hz)')
@@ -710,13 +729,17 @@ class AlignmentWidget(QWidget):
             ax.set_xlim(t_flo, t_fhi)
             # Auto-scale ylim to visible data
             band_t = (f_y >= t_flo) & (f_y <= t_fhi)
-            if np.any(band_t):
+            if self._cb_ylog.isChecked():
+                ax.set_yscale('log')
+            elif np.any(band_t):
                 y_vis = [float(np.max(asd_y[band_t]))]
                 if asd_x_i is not None:
                     y_vis.append(float(np.max((trans_sens * asd_x_i)[band_t])))
                 if asd_z_i is not None:
                     y_vis.append(float(np.max((trans_sens * asd_z_i)[band_t])))
                 ax.set_ylim(0, max(y_vis) * 1.15)
+            if self._cb_xlog.isChecked():
+                ax.set_xscale('log')
             ax.legend(fontsize=8)
             ax.grid(True, which='both', ls=':')
 
@@ -798,8 +821,12 @@ class AlignmentWidget(QWidget):
                    label=f'Spec: {noise_spec_ug} µg/√Hz')
 
         ax.set_xlim(f_lo, f_hi)
-        if y_maxes:
+        if self._cb_ylog.isChecked():
+            ax.set_yscale('log')
+        elif y_maxes:
             ax.set_ylim(0, max(y_maxes) * 1.15)
+        if self._cb_xlog.isChecked():
+            ax.set_xscale('log')
         ax.set_xlabel('Frequency (Hz)')
         ax.set_ylabel('Accel ASD  [g/√Hz]')
         ax.set_title(f'{label} — solid: accelerometer, dashed: encoder-derived',
