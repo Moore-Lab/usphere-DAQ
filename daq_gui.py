@@ -235,6 +235,39 @@ class _RecorderSignals(QObject):
 
 
 # ---------------------------------------------------------------------------
+# DAQ controller facade (injected into plugins)
+# ---------------------------------------------------------------------------
+
+from plugins.base import DAQController as _DAQControllerBase
+
+
+class _GUIDAQController(_DAQControllerBase):
+    """Concrete controller that delegates to MainWindow."""
+
+    def __init__(self, main_window):
+        self._mw = main_window
+
+    def read_config(self):
+        return self._mw._read_config()
+
+    def start_recording(self, n_files=1, basename=None):
+        cfg = self._mw._read_config()
+        cfg.n_files = n_files
+        if basename is not None:
+            cfg.basename = basename
+        self._mw._start_recording_with_config(cfg)
+
+    def stop_recording(self):
+        rec = self._mw._recorder
+        if rec and rec.is_running():
+            rec.stop()
+
+    def is_recording(self):
+        rec = self._mw._recorder
+        return rec is not None and rec.is_running()
+
+
+# ---------------------------------------------------------------------------
 # Plugin manager widget
 # ---------------------------------------------------------------------------
 
@@ -247,6 +280,7 @@ class PluginManagerWidget(QWidget):
         self._loaded: dict[str, tuple[object, QWidget]] = {}   # name → (plugin, widget)
         self._buttons: dict[str, QPushButton] = {}
         self._available: list = []
+        self._daq_controller = None  # set by MainWindow after construction
 
         try:
             from plugins import discover_plugins
@@ -300,6 +334,8 @@ class PluginManagerWidget(QWidget):
 
     def _load(self, cls):
         plugin = cls()
+        if self._daq_controller is not None:
+            plugin.daq = self._daq_controller
         widget = plugin.create_widget()
         self._tabs.addTab(widget, plugin.NAME)
         self._loaded[plugin.NAME] = (plugin, widget)
@@ -405,6 +441,7 @@ class MainWindow(QMainWindow):
 
         # --- Tab 3: Plugins ---
         self._plugins_tab = PluginManagerWidget(tabs)
+        self._plugins_tab._daq_controller = _GUIDAQController(self)
         tabs.addTab(self._plugins_tab, "Plugins")
 
         # --- Tab 4: Plot ---
@@ -725,6 +762,39 @@ class MainWindow(QMainWindow):
         mode = "continuous" if cfg.n_files == 0 else f"{cfg.n_files} file(s)"
         self._append_status(
             f"\n[{ts}] Starting  |  {len(cfg.active_channels)} ch  "
+            f"|  {cfg.sample_rate:g} Hz  |  2^{cfg.n_bits} = {cfg.n_samples:,} samples  "
+            f"|  {cfg.duration_s:.2f} s/file  |  mode: {mode}"
+        )
+
+        sig = self._signals
+        self._recorder = DAQRecorder(
+            config=cfg,
+            on_status=lambda msg: sig.status_message.emit(msg),
+            on_file_written=lambda p: sig.file_written.emit(str(p)),
+            on_finished=sig.finished.emit,
+        )
+        self._recorder.start()
+        self._apply_btn_style(running=True)
+        self._set_inputs_enabled(False)
+
+    def _start_recording_with_config(self, cfg):
+        """Start a recording with a pre-built DAQConfig (used by plugins)."""
+        if self._recorder and self._recorder.is_running():
+            self._append_status("Error: a recording is already in progress.")
+            return
+
+        if not cfg.active_channels:
+            self._append_status("Error: select at least one channel before recording.")
+            return
+
+        self._files_written = 0
+        self._files_lbl.setText("Files written this session: 0")
+        append_log(cfg)
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        mode = "continuous" if cfg.n_files == 0 else f"{cfg.n_files} file(s)"
+        self._append_status(
+            f"\n[{ts}] Starting (plugin)  |  {len(cfg.active_channels)} ch  "
             f"|  {cfg.sample_rate:g} Hz  |  2^{cfg.n_bits} = {cfg.n_samples:,} samples  "
             f"|  {cfg.duration_s:.2f} s/file  |  mode: {mode}"
         )

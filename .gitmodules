@@ -1,3 +1,6 @@
 [submodule "Microsphere-Utility-Scripts"]
 	path = Microsphere-Utility-Scripts
 	url = https://github.com/Moore-Lab/Microsphere-Utility-Scripts.git
+[submodule "ESP32-stepper-controller"]
+	path = ESP32-stepper-controller
+	url = https://github.com/Moore-Lab/ESP32-stepper-controller.git
