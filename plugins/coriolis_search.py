@@ -20,6 +20,7 @@ template.  A summary heatmap of SNR vs. parameters is updated live.
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -78,6 +79,47 @@ def _get_stepper_controller_class():
 N_PHASE_BINS = 512
 
 _WAVE_FIRMWARE = {"Sine": "SINE", "Triangle": "TRAP", "Rounded Triangle": "SCURVE"}
+
+
+def _apply_waveform_params(ctrl, wave_name: str, amp: float, freq: float, duty: float):
+    """Send waveform parameters to ESP32 with proper velocity/acceleration.
+
+    Mirrors the logic from the ESP32 GUI's _on_apply_waveform so that
+    max velocity and acceleration are set correctly for each waveform.
+    """
+    ctrl.set_amplitude(amp)
+
+    if wave_name == "Sine":
+        ctrl.set_frequency(freq)
+        ctrl.set_waveform("SINE")
+        v_max = 2.0 * math.pi * freq * amp
+        a_max = (2.0 * math.pi * freq) ** 2 * amp
+        ctrl.set_velocity(v_max)
+        ctrl.set_acceleration(a_max)
+
+    elif wave_name == "Triangle":
+        # T0 = 8A / (s*(1+F)) and freq = 1/T0  =>  s = 8*A*f / (1+F)
+        vel = 8.0 * amp * freq / (1.0 + duty)
+        T0 = 1.0 / freq if freq > 0 else 1.0
+        dc = (1.0 - duty) * T0 / 4.0
+        a_cap = vel / dc if dc > 0 else 0.0
+        ctrl.set_velocity(vel)
+        ctrl.set_acceleration(a_cap)
+        ctrl.set_duty_cycle(duty)
+        ctrl.set_waveform("TRAP")
+
+    elif wave_name == "Rounded Triangle":
+        # T0 = 12A / (s*(2+F)) and freq = 1/T0  =>  s = 12*A*f / (2+F)
+        vel = 12.0 * amp * freq / (2.0 + duty)
+        T0 = 1.0 / freq if freq > 0 else 1.0
+        Tj = (1.0 - duty) * T0 / 4.0
+        jerk = 2.0 * vel / (Tj * Tj) if Tj > 0 else 0.0
+        a_peak = jerk * Tj if Tj > 0 else 0.0
+        ctrl.set_velocity(vel)
+        ctrl.set_acceleration(a_peak)
+        ctrl.set_jerk(jerk)
+        ctrl.set_duty_cycle(duty)
+        ctrl.set_waveform("SCURVE")
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +286,10 @@ def coriolis_template(
 class ContinuousWidget(QWidget):
     """Run the motor at one setting, accumulate cycles indefinitely."""
 
-    def __init__(self, parent=None):
+    def __init__(self, plugin: "Plugin", parent=None):
         super().__init__(parent)
+        self._plugin = plugin
+        self._ctrl = None
         self._accel_acc = TemplateAccumulator()
         self._encoder_acc = TemplateAccumulator()
         self._total_cycles = 0
@@ -255,6 +299,74 @@ class ContinuousWidget(QWidget):
     def _init_ui(self):
         top = QVBoxLayout(self)
 
+        # --- ESP32 Connection ---
+        conn_grp = QGroupBox("ESP32 Connection")
+        conn_lay = QHBoxLayout(conn_grp)
+        conn_lay.addWidget(QLabel("Port:"))
+        self._port_edit = QLineEdit()
+        self._port_edit.setPlaceholderText("Auto-detect")
+        self._port_edit.setMaximumWidth(120)
+        conn_lay.addWidget(self._port_edit)
+        self._connect_btn = QPushButton("Connect")
+        self._connect_btn.clicked.connect(self._toggle_connect)
+        conn_lay.addWidget(self._connect_btn)
+        self._conn_status = QLabel("Disconnected")
+        self._conn_status.setStyleSheet("color: gray;")
+        conn_lay.addWidget(self._conn_status)
+        conn_lay.addStretch()
+        top.addWidget(conn_grp)
+
+        # --- Motor Control ---
+        motor_grp = QGroupBox("Motor Control")
+        motor_lay = QVBoxLayout(motor_grp)
+        m1 = QHBoxLayout()
+        m1.addWidget(QLabel("Waveform:"))
+        self._wave_combo = QComboBox()
+        self._wave_combo.addItems(["Sine", "Triangle", "Rounded Triangle"])
+        m1.addWidget(self._wave_combo)
+        m1.addWidget(QLabel("Amplitude (mm):"))
+        self._amp_spin = QDoubleSpinBox()
+        self._amp_spin.setRange(0.001, 10.0); self._amp_spin.setValue(0.5)
+        self._amp_spin.setDecimals(3); self._amp_spin.setSingleStep(0.1)
+        self._amp_spin.setMaximumWidth(80)
+        m1.addWidget(self._amp_spin)
+        m1.addWidget(QLabel("Frequency (Hz):"))
+        self._freq_spin = QDoubleSpinBox()
+        self._freq_spin.setRange(0.01, 100.0); self._freq_spin.setValue(1.0)
+        self._freq_spin.setDecimals(3); self._freq_spin.setSingleStep(0.1)
+        self._freq_spin.setMaximumWidth(80)
+        m1.addWidget(self._freq_spin)
+        m1.addWidget(QLabel("Duty cycle:"))
+        self._duty_spin = QDoubleSpinBox()
+        self._duty_spin.setRange(0.1, 0.99); self._duty_spin.setValue(0.90)
+        self._duty_spin.setDecimals(2); self._duty_spin.setSingleStep(0.01)
+        self._duty_spin.setMaximumWidth(70)
+        m1.addWidget(self._duty_spin)
+        motor_lay.addLayout(m1)
+
+        m2 = QHBoxLayout()
+        self._apply_start_btn = QPushButton("Apply && Start Motor")
+        self._apply_start_btn.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: white; "
+            "font-weight: bold; padding: 4px 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #3b82f6; }")
+        self._apply_start_btn.clicked.connect(self._apply_and_start_motor)
+        m2.addWidget(self._apply_start_btn)
+        self._stop_motor_btn = QPushButton("Stop Motor")
+        self._stop_motor_btn.setStyleSheet(
+            "QPushButton { background-color: #dc2626; color: white; "
+            "font-weight: bold; padding: 4px 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #ef4444; }")
+        self._stop_motor_btn.clicked.connect(self._stop_motor)
+        m2.addWidget(self._stop_motor_btn)
+        self._motor_status = QLabel("")
+        self._motor_status.setStyleSheet("color: gray; font-size: 10px;")
+        m2.addWidget(self._motor_status)
+        m2.addStretch()
+        motor_lay.addLayout(m2)
+        top.addWidget(motor_grp)
+
+        # --- Hardware & Calibration ---
         hw_grp = QGroupBox("Hardware && Calibration")
         hw_lay = QVBoxLayout(hw_grp)
 
@@ -269,10 +381,6 @@ class ContinuousWidget(QWidget):
         self._encoder_ch.addItems(daq_h5.ALL_CHANNELS)
         self._encoder_ch.setCurrentIndex(min(17, len(daq_h5.ALL_CHANNELS) - 1))
         r1.addWidget(self._encoder_ch)
-        r1.addWidget(QLabel("Waveform:"))
-        self._wave_combo = QComboBox()
-        self._wave_combo.addItems(["Sine", "Triangle", "Rounded Triangle"])
-        r1.addWidget(self._wave_combo)
         hw_lay.addLayout(r1)
 
         r2 = QHBoxLayout()
@@ -317,31 +425,38 @@ class ContinuousWidget(QWidget):
         r3.addWidget(self._n_bins_spin)
         hw_lay.addLayout(r3)
 
-        r4 = QHBoxLayout()
-        r4.addWidget(QLabel("Triangle duty cycle:"))
-        self._duty_spin = QDoubleSpinBox()
-        self._duty_spin.setRange(0.1, 0.99); self._duty_spin.setValue(0.90)
-        self._duty_spin.setDecimals(2); self._duty_spin.setSingleStep(0.01)
-        self._duty_spin.setMaximumWidth(70)
-        r4.addWidget(self._duty_spin)
-        r4.addStretch()
-        hw_lay.addLayout(r4)
-
         top.addWidget(hw_grp)
 
-        ctrl = QHBoxLayout()
+        # --- Acquisition & Template Control ---
+        acq = QHBoxLayout()
+        acq.addWidget(QLabel("N files:"))
+        self._n_files_spin = QSpinBox()
+        self._n_files_spin.setRange(1, 100000); self._n_files_spin.setValue(100)
+        self._n_files_spin.setMaximumWidth(80)
+        acq.addWidget(self._n_files_spin)
+        self._record_btn = QPushButton("Start Recording")
+        self._record_btn.setStyleSheet(
+            "QPushButton { background-color: #16a34a; color: white; "
+            "font-weight: bold; padding: 4px 12px; border-radius: 4px; }")
+        self._record_btn.clicked.connect(self._start_recording)
+        acq.addWidget(self._record_btn)
+        self._stop_rec_btn = QPushButton("Stop Recording")
+        self._stop_rec_btn.clicked.connect(self._stop_recording)
+        acq.addWidget(self._stop_rec_btn)
+
+        acq.addWidget(QLabel("  "))
         self._live_btn = QPushButton("Live: OFF")
         self._live_btn.setCheckable(True)
         self._live_btn.toggled.connect(self._toggle_live)
         self._apply_live_style(False)
-        ctrl.addWidget(self._live_btn)
+        acq.addWidget(self._live_btn)
         self._reset_btn = QPushButton("Reset Template")
         self._reset_btn.clicked.connect(self._reset)
-        ctrl.addWidget(self._reset_btn)
+        acq.addWidget(self._reset_btn)
         self._cycle_lbl = QLabel("Cycles: 0")
-        ctrl.addWidget(self._cycle_lbl)
-        ctrl.addStretch()
-        top.addLayout(ctrl)
+        acq.addWidget(self._cycle_lbl)
+        acq.addStretch()
+        top.addLayout(acq)
 
         self._plot_layout = QVBoxLayout()
         top.addLayout(self._plot_layout, stretch=1)
@@ -354,6 +469,88 @@ class ContinuousWidget(QWidget):
     # helpers
     def _log(self, msg: str):
         self._log_box.append(msg)
+
+    # ---- ESP32 connection ----
+    def _toggle_connect(self):
+        if self._ctrl is not None:
+            try:
+                self._ctrl.stop(); self._ctrl.disable(); self._ctrl.disconnect()
+            except Exception:
+                pass
+            self._ctrl = None
+            self._connect_btn.setText("Connect")
+            self._conn_status.setText("Disconnected")
+            self._conn_status.setStyleSheet("color: gray;")
+            self._log("ESP32 disconnected.")
+            return
+        try:
+            SC, find_port = _get_stepper_controller_class()
+            port = self._port_edit.text().strip()
+            if not port:
+                port = find_port()
+                if port is None:
+                    self._log("ERROR: Could not auto-detect ESP32 port.")
+                    return
+                self._port_edit.setText(port)
+            self._ctrl = SC(port)
+            self._ctrl.set_line_callback(lambda line: None)
+            self._ctrl.connect()
+            self._connect_btn.setText("Disconnect")
+            self._conn_status.setText(f"Connected ({port})")
+            self._conn_status.setStyleSheet("color: green; font-weight: bold;")
+            self._log(f"Connected to ESP32 on {port}")
+        except Exception as exc:
+            self._log(f"Connection error: {exc}")
+            self._ctrl = None
+
+    # ---- Motor control ----
+    def _apply_and_start_motor(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first.")
+            return
+        wave = self._wave_combo.currentText()
+        amp = self._amp_spin.value()
+        freq = self._freq_spin.value()
+        duty = self._duty_spin.value()
+        try:
+            self._ctrl.enable()
+            _apply_waveform_params(self._ctrl, wave, amp, freq, duty)
+            self._ctrl.start()
+            self._motor_status.setText(
+                f"{wave}  A={amp:.3f} mm  f={freq:.3f} Hz  duty={duty:.2f}")
+            self._motor_status.setStyleSheet("color: green; font-size: 10px;")
+            self._log(f"Motor started: {wave} A={amp:.3f} mm f={freq:.3f} Hz duty={duty:.2f}")
+        except Exception as exc:
+            self._log(f"Motor error: {exc}")
+
+    def _stop_motor(self):
+        if self._ctrl is None:
+            return
+        try:
+            self._ctrl.stop()
+            self._motor_status.setText("Stopped")
+            self._motor_status.setStyleSheet("color: gray; font-size: 10px;")
+            self._log("Motor stopped.")
+        except Exception as exc:
+            self._log(f"Stop error: {exc}")
+
+    # ---- DAQ recording ----
+    def _start_recording(self):
+        if self._plugin.daq is None:
+            self._log("ERROR: DAQ controller not available.")
+            return
+        if self._plugin.daq.is_recording():
+            self._log("Already recording.")
+            return
+        n = self._n_files_spin.value()
+        self._plugin.daq.start_recording(n_files=n)
+        self._log(f"Recording started ({n} files).")
+
+    def _stop_recording(self):
+        if self._plugin.daq is None:
+            return
+        self._plugin.daq.stop_recording()
+        self._log("Recording stopped.")
 
     def _apply_live_style(self, on: bool):
         if on:
@@ -565,10 +762,7 @@ class _ScanWorker(QThread):
                     f"A={amp:.3f} mm  f={freq:.3f} Hz  duty={duty:.2f} ---"
                 )
 
-                ctrl.set_waveform(wave_fw)
-                ctrl.set_amplitude(amp)
-                ctrl.set_frequency(freq)
-                ctrl.set_duty_cycle(duty)
+                _apply_waveform_params(ctrl, wave_name, amp, freq, duty)
                 ctrl.start()
 
                 # Settle
@@ -1156,7 +1350,7 @@ class Plugin(AnalysisPlugin):
 
     def create_widget(self, parent=None):
         self._tabs = QTabWidget()
-        self._cont_widget = ContinuousWidget()
+        self._cont_widget = ContinuousWidget(self)
         self._scan_widget = ScanWidget(self)
         self._tabs.addTab(self._cont_widget, "Continuous")
         self._tabs.addTab(self._scan_widget, "Scan")
