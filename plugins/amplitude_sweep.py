@@ -136,9 +136,9 @@ class _SweepWorker(QThread):
 
                 # Trigger DAQ recording
                 if self._mode == "amplitude":
-                    basename = f"sweep_amp_{amp:.3f}mm"
+                    basename = f"sweep_amp_{amp:.3f}mm".replace('.', '_')
                 else:
-                    basename = f"sweep_freq_{freq:.3f}Hz"
+                    basename = f"sweep_freq_{freq:.3f}Hz".replace('.', '_')
                 self._file_event = False
                 self._file_path = None
                 self.request_recording.emit(basename)
