@@ -41,6 +41,7 @@ from matplotlib.backends.backend_qt5agg import (
 from matplotlib.figure import Figure
 from scipy.signal import welch
 
+import daq_h5
 from plugins.base import AnalysisPlugin
 
 # ---------------------------------------------------------------------------
@@ -327,8 +328,7 @@ class SweepWidget(QWidget):
         r3.addWidget(self._rms_hi)
         r3.addWidget(QLabel("Accel ch:"))
         self._accel_ch = QComboBox()
-        from daq_h5 import ALL_CHANNELS
-        self._accel_ch.addItems(ALL_CHANNELS)
+        self._accel_ch.addItems(daq_h5.ALL_CHANNELS)
         self._accel_ch.setCurrentIndex(0)
         r3.addWidget(self._accel_ch)
         r3.addWidget(QLabel("Sensitivity (mV/g):"))
@@ -592,26 +592,12 @@ class SweepWidget(QWidget):
 
     def _analyse_file(self, filepath: str) -> float:
         """Compute broadband RMS acceleration in [rms_lo, rms_hi] Hz."""
-        import h5py
         ch = self._accel_ch.currentText()
         sensitivity = float(self._sens_edit.text()) if self._sens_edit.text() else 1000.0
         f_lo = self._rms_lo.value()
         f_hi = self._rms_hi.value()
 
-        with h5py.File(filepath, "r") as f:
-            ds = f[ch]
-            raw = ds[:]
-
-            # Handle int16 ADC (schema v3) or float
-            if raw.dtype == np.int16:
-                v_min = ds.attrs.get("voltage_min", -10.0)
-                v_max = ds.attrs.get("voltage_max", 10.0)
-                lsb = (v_max - v_min) / 65536
-                data = raw.astype(np.float64) * lsb + v_min + lsb / 2
-            else:
-                data = raw.astype(np.float64)
-
-            fs = f.attrs.get("sample_rate", 10000.0)
+        data, fs = daq_h5.read_channel(filepath, ch)
 
         # Compute ASD
         nperseg = min(2**15, len(data))
