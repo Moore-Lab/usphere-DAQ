@@ -327,7 +327,8 @@ class SweepWidget(QWidget):
         r3.addWidget(self._rms_hi)
         r3.addWidget(QLabel("Accel ch:"))
         self._accel_ch = QComboBox()
-        self._accel_ch.addItems(["ai0", "ai1", "ai2", "ai3"])
+        from daq_h5 import ALL_CHANNELS
+        self._accel_ch.addItems(ALL_CHANNELS)
         self._accel_ch.setCurrentIndex(0)
         r3.addWidget(self._accel_ch)
         r3.addWidget(QLabel("Sensitivity (mV/g):"))
