@@ -264,7 +264,7 @@ class TemplateAccumulator:
 # ---------------------------------------------------------------------------
 
 def get_coriolis_phase_ranges(
-    waveform: str, duty: float = 0.9,
+    half_width_deg: float = 60.0,
 ) -> list[tuple[float, float]]:
     """Phase ranges (degrees) where table velocity is large.
 
@@ -275,30 +275,32 @@ def get_coriolis_phase_ranges(
         270°      = position trough (-A, velocity = 0, turning point)
 
     The Coriolis acceleration is proportional to velocity, so the
-    Coriolis-active regions are the constant-velocity segments
-    centered on 0° and 180°, NOT the turning points at 90° and 270°.
+    Coriolis-active regions are centred on 0° and 180° (velocity peaks)
+    with a user-specified half-width.
     """
+    hw = max(1.0, min(half_width_deg, 89.0))  # clamp to (1, 89)
+    return [
+        (0.0, hw),
+        (180.0 - hw, 180.0 + hw),
+        (360.0 - hw, 360.0),
+    ]
+
+
+def _default_half_width(waveform: str, duty: float = 0.9) -> float:
+    """Suggested half-width based on the waveform's constant-velocity fraction."""
     if waveform == "Sine":
-        # |cos(θ)| > 0.5  →  θ ∈ [0,60] ∪ [120,240] ∪ [300,360]
-        return [(0.0, 60.0), (120.0, 240.0), (300.0, 360.0)]
-    else:
-        # Corners centered at 90° and 270°; half-width = (1-duty)/2 × 180°
-        corner_half = (1.0 - duty) / 2.0 * 180.0
-        return [
-            (0.0, 90.0 - corner_half),
-            (90.0 + corner_half, 270.0 - corner_half),
-            (270.0 + corner_half, 360.0),
-        ]
+        return 60.0   # |cos θ| > 0.5
+    corner_half = (1.0 - duty) / 2.0 * 180.0
+    return 90.0 - corner_half  # excludes turning-point corners
 
 
-def mark_coriolis_region(ax, waveform: str, phase_deg: NDArray, duty: float = 0.9):
-    regions = get_coriolis_phase_ranges(waveform, duty)
+def mark_coriolis_region(ax, phase_deg: NDArray, half_width_deg: float = 60.0):
+    regions = get_coriolis_phase_ranges(half_width_deg)
     for lo, hi in regions:
         ax.axvspan(lo, hi, alpha=0.10, color="green", zorder=0)
     if regions and len(regions) > 1:
-        mid = (regions[1][0] + regions[1][1]) / 2.0
         ax.annotate(
-            "Coriolis region", xy=(mid, 0),
+            "Search region", xy=(180.0, 0),
             xycoords=("data", "axes fraction"),
             xytext=(0, -12), textcoords="offset points",
             fontsize=7, color="green", ha="center", va="top",
@@ -306,12 +308,12 @@ def mark_coriolis_region(ax, waveform: str, phase_deg: NDArray, duty: float = 0.
 
 
 def compute_snr(
-    waveform: str, accel_mean: NDArray, accel_sem: NDArray,
-    phase: NDArray, duty: float = 0.9,
+    accel_mean: NDArray, accel_sem: NDArray,
+    phase: NDArray, half_width_deg: float = 60.0,
 ) -> tuple[float, float, float]:
-    """Return (|mean_residual|, mean_sem, snr) in the Coriolis region."""
+    """Return (|mean_residual|, mean_sem, snr) in the search region."""
     phase_deg = phase * 360.0
-    regions = get_coriolis_phase_ranges(waveform, duty)
+    regions = get_coriolis_phase_ranges(half_width_deg)
     mask = np.zeros(len(phase_deg), dtype=bool)
     for lo, hi in regions:
         mask |= (phase_deg >= lo) & (phase_deg <= hi)
@@ -324,35 +326,69 @@ def compute_snr(
     return mean_abs, sem_avg, snr
 
 
+def matched_filter_snr(
+    accel_mean: NDArray, accel_sem: NDArray,
+    template: NDArray,
+) -> tuple[float, float, float]:
+    """Optimal matched-filter amplitude estimate and SNR.
+
+    The template *t* is the predicted Coriolis shape (arbitrary units).
+    The data *d* is the mean-subtracted accelerometer template.
+
+        Â  = Σ(t·d / σ²) / Σ(t² / σ²)
+        σ_Â² = 1 / Σ(t² / σ²)
+        SNR = |Â| / σ_Â
+
+    This is the Wiener/optimal linear estimator: it weights each phase
+    bin by the local SEM, so noisy bins contribute less.  Harmonics
+    orthogonal to *t* are rejected regardless of amplitude.
+
+    Returns (A_hat, sigma_A, snr)  — all in the same units as *accel_mean*.
+    """
+    d = accel_mean - np.mean(accel_mean)
+    t = template.copy()
+    sigma = np.maximum(accel_sem, 1e-30)  # avoid /0
+    w = t / (sigma * sigma)               # weight vector
+    denom = float(np.sum(t * w))           # Σ t²/σ²
+    if denom <= 0:
+        return 0.0, 0.0, 0.0
+    A_hat = float(np.sum(d * w)) / denom
+    sigma_A = 1.0 / math.sqrt(denom)
+    snr = abs(A_hat) / sigma_A if sigma_A > 0 else 0.0
+    return A_hat, sigma_A, snr
+
+
 def coriolis_template(
     enc_mean_mm: NDArray, phase: NDArray, cycle_period_s: float,
 ) -> tuple[NDArray, NDArray]:
     """Predicted Coriolis acceleration from the phase-folded encoder.
 
-    The table moves east/west (x-direction) with position recorded by
-    the encoder.  The Coriolis acceleration in the perpendicular
-    horizontal direction (y) is:
+    Coordinates: +x = east, +y = north, +z = up (right-handed ENU).
+    The table oscillates along x; the accelerometer measures y.
 
-        a_Cor(t) = κ · v_table(t)          (coriolis_sensitivity.md §1)
+    In the Northern hemisphere the Coriolis acceleration in y is:
+
+        a_y(t) = −κ · ẋ_table(t)
 
     where κ = 2 Ω_⊕ sin λ ≈ 9.61 × 10⁻⁵ rad/s at Yale.
+    Moving east (ẋ > 0) deflects south (a_y < 0).
 
     Parameters
     ----------
-    enc_mean_mm    : Phase-folded encoder position [mm].
+    enc_mean_mm    : Phase-folded encoder position x [mm].
     phase          : Phase grid (0 to 1, N_PHASE_BINS points).
     cycle_period_s : Mean oscillation period [s].
 
     Returns
     -------
-    a_cor_g : Predicted Coriolis acceleration [g].
-    v_mms   : Table velocity [mm/s].
+    a_cor_g : Predicted Coriolis acceleration along y [g].
+    v_mms   : Table velocity ẋ [mm/s].
     """
     dphi = phase[1] - phase[0] if len(phase) > 1 else 1.0
     dt = dphi * cycle_period_s                        # seconds per phase bin
     v_mms = np.gradient(enc_mean_mm, dt)              # mm/s
     v_ms  = v_mms * 1e-3                              # m/s
-    a_cor_ms2 = KAPPA * v_ms                          # m/s²
+    a_cor_ms2 = -KAPPA * v_ms                         # m/s²  (negative sign)
     a_cor_g   = a_cor_ms2 / G_ACCEL                   # g
     return a_cor_g, v_mms
 
@@ -556,6 +592,18 @@ class ContinuousWidget(QWidget):
         self._n_bins_spin.setRange(64, 4096); self._n_bins_spin.setValue(N_PHASE_BINS)
         self._n_bins_spin.setSingleStep(64); self._n_bins_spin.setMaximumWidth(70)
         r3.addWidget(self._n_bins_spin)
+        r3.addWidget(QLabel("Search ±(°):"))
+        self._search_hw_spin = QDoubleSpinBox()
+        self._search_hw_spin.setRange(1.0, 89.0)
+        self._search_hw_spin.setValue(
+            _default_half_width(self._wave_combo.currentText(),
+                                self._duty_spin.value()))
+        self._search_hw_spin.setDecimals(1); self._search_hw_spin.setSingleStep(5.0)
+        self._search_hw_spin.setMaximumWidth(60)
+        self._search_hw_spin.setToolTip(
+            "Half-width (degrees) of the search region centred on\n"
+            "0° and 180° (the velocity peaks).")
+        r3.addWidget(self._search_hw_spin)
         hw_lay.addLayout(r3)
 
         top.addWidget(hw_grp)
@@ -590,9 +638,6 @@ class ContinuousWidget(QWidget):
         acq.addWidget(self._cycle_lbl)
         acq.addStretch()
         top.addLayout(acq)
-
-        self._plot_layout = QVBoxLayout()
-        top.addLayout(self._plot_layout, stretch=1)
 
         self._log_box = QTextEdit()
         self._log_box.setReadOnly(True)
@@ -868,15 +913,7 @@ class ContinuousWidget(QWidget):
         self._update_plot()
 
     # plotting
-    def _clear_plots(self):
-        while self._plot_layout.count():
-            item = self._plot_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
     def _update_plot(self):
-        self._clear_plots()
         if self._accel_acc.count < 2:
             return
         n_bins = self._accel_acc.n_bins
@@ -887,56 +924,168 @@ class ContinuousWidget(QWidget):
         enc_mean = self._encoder_acc.mean   # mm
         n_cycles = self._accel_acc.count
         waveform = self._wave_combo.currentText()
-        duty = self._duty_spin.value()
         T_s = self._mean_period_s if self._mean_period_s > 0 else 1.0
 
         # Physical Coriolis prediction from encoder velocity
         a_cor_g, v_mms = coriolis_template(enc_mean, phase, T_s)
 
-        fig = Figure(figsize=(10, 8), tight_layout=True)
+        accel_ug = accel_mean * 1e6       # g → µg
+        sem_ug   = accel_sem * 1e6
+        a_cor_ug = a_cor_g * 1e6          # g → µg
+        cor_peak_ug = float(np.max(np.abs(a_cor_ug)))
+        residual_ug = accel_ug - np.mean(accel_ug)
+        search_hw = self._search_hw_spin.value()
+        mean_abs, sem_avg, snr_region = compute_snr(
+            accel_mean, accel_sem, phase, search_hw)
+        mf_A, mf_sigma, snr_mf = matched_filter_snr(
+            accel_mean, accel_sem, a_cor_g)
+        v_peak = float(np.max(np.abs(v_mms)))
 
-        # --- Panel 1: Encoder position (mm) & table velocity (mm/s) ---
-        ax1 = fig.add_subplot(3, 1, 1)
+        self._plugin._plot_widget.update(
+            phase_deg=phase_deg,
+            enc_mean=enc_mean,
+            v_mms=v_mms,
+            accel_ug=accel_ug,
+            sem_ug=sem_ug,
+            a_cor_ug=a_cor_ug,
+            residual_ug=residual_ug,
+            cor_peak_ug=cor_peak_ug,
+            search_hw=search_hw,
+            waveform=waveform,
+            n_cycles=n_cycles,
+            T_s=T_s,
+            v_peak=v_peak,
+            mean_abs=mean_abs,
+            sem_avg=sem_avg,
+            snr_region=snr_region,
+            mf_A_ug=mf_A * 1e6,
+            mf_sigma_ug=mf_sigma * 1e6,
+            snr_mf=snr_mf,
+        )
+
+
+# ===================================================================
+#  PLOT WIDGET  (dedicated tab for continuous-mode plots)
+# ===================================================================
+
+class PlotWidget(QWidget):
+    """Persistent 3-panel phase-folded template plot with shared x-axis
+    and a log/linear y-axis toggle."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+
+        # Toolbar row: log toggle + SNR mode
+        btn_row = QHBoxLayout()
+        self._log_btn = QPushButton("Log Y")
+        self._log_btn.setCheckable(True)
+        self._log_btn.setChecked(False)
+        self._log_btn.toggled.connect(self._toggle_log)
+        btn_row.addWidget(self._log_btn)
+
+        btn_row.addWidget(QLabel("  SNR mode:"))
+        self._snr_mode_group = QButtonGroup(self)
+        self._snr_region_rb = QRadioButton("Region avg")
+        self._snr_mf_rb = QRadioButton("Matched filter")
+        self._snr_region_rb.setChecked(True)
+        self._snr_mode_group.addButton(self._snr_region_rb, 0)
+        self._snr_mode_group.addButton(self._snr_mf_rb, 1)
+        self._snr_mode_group.buttonToggled.connect(self._on_snr_mode_changed)
+        btn_row.addWidget(self._snr_region_rb)
+        btn_row.addWidget(self._snr_mf_rb)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        # Persistent figure & canvas
+        self._fig = Figure(tight_layout=True)
+        self._axes = self._fig.subplots(3, 1, sharex=True)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._toolbar = NavigationToolbar2QT(self._canvas, self)
+        lay.addWidget(self._toolbar)
+        lay.addWidget(self._canvas, stretch=1)
+
+        self._log_scale = False
+        self._last_kwargs = None   # stash for re-draw on mode toggle
+
+    # --- public -----------------------------------------------------------
+    def update(self, *, phase_deg, enc_mean, v_mms,
+               accel_ug, sem_ug, a_cor_ug, residual_ug, cor_peak_ug,
+               search_hw, waveform, n_cycles, T_s, v_peak,
+               mean_abs, sem_avg, snr_region,
+               mf_A_ug, mf_sigma_ug, snr_mf):
+        self._last_kwargs = dict(
+            phase_deg=phase_deg, enc_mean=enc_mean, v_mms=v_mms,
+            accel_ug=accel_ug, sem_ug=sem_ug, a_cor_ug=a_cor_ug,
+            residual_ug=residual_ug, cor_peak_ug=cor_peak_ug,
+            search_hw=search_hw, waveform=waveform, n_cycles=n_cycles,
+            T_s=T_s, v_peak=v_peak, mean_abs=mean_abs, sem_avg=sem_avg,
+            snr_region=snr_region, mf_A_ug=mf_A_ug,
+            mf_sigma_ug=mf_sigma_ug, snr_mf=snr_mf,
+        )
+        self._draw()
+
+    def _draw(self):
+        if self._last_kwargs is None:
+            return
+        kw = self._last_kwargs
+        phase_deg = kw["phase_deg"]; enc_mean = kw["enc_mean"]
+        v_mms = kw["v_mms"]; accel_ug = kw["accel_ug"]
+        sem_ug = kw["sem_ug"]; a_cor_ug = kw["a_cor_ug"]
+        residual_ug = kw["residual_ug"]; cor_peak_ug = kw["cor_peak_ug"]
+        search_hw = kw["search_hw"]; waveform = kw["waveform"]
+        n_cycles = kw["n_cycles"]; T_s = kw["T_s"]
+        v_peak = kw["v_peak"]; mean_abs = kw["mean_abs"]
+        sem_avg = kw["sem_avg"]; snr_region = kw["snr_region"]
+        mf_A_ug = kw["mf_A_ug"]; mf_sigma_ug = kw["mf_sigma_ug"]
+        snr_mf = kw["snr_mf"]
+        use_mf = self._snr_mf_rb.isChecked()
+
+        ax1, ax2, ax3 = self._axes
+        for ax in self._axes:
+            ax.clear()
+
+        # --- Panel 1: encoder position + velocity twin axis ---
         ax1.plot(phase_deg, enc_mean, "b-", lw=1.2,
-                 label="Table position x (mm)")
-        ax1.set_ylabel("Table position x (mm)")
+                 label="Position (mm)")
+        ax1.set_ylabel("x pos\n(mm)", fontsize=9)
         ax1.set_title(
             f"Phase-folded template — {n_cycles} cycles — {waveform}"
             f" — T = {T_s:.3f} s ({1/T_s:.2f} Hz)",
             fontsize=11)
         ax1.legend(loc="upper right", fontsize=8)
-        ax1.set_xlim(0, 360); ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(0, 360)
+        ax1.grid(True, alpha=0.3)
+
+        # Twin velocity axis (recreate each time since clear() removes it)
+        for a in self._fig.axes:
+            if a not in self._axes:
+                a.remove()
         ax1v = ax1.twinx()
         ax1v.plot(phase_deg, v_mms, "r--", alpha=0.6, lw=0.9,
-                  label="Velocity ẋ (mm/s)")
-        ax1v.set_ylabel("Table velocity ẋ (mm/s)", color="r", fontsize=8)
+                  label="Velocity (mm/s)")
+        ax1v.set_ylabel("ẋ\n(mm/s)", color="r", fontsize=9)
         ax1v.tick_params(axis="y", colors="r", labelsize=7)
         ax1v.legend(loc="lower right", fontsize=8)
 
-        # --- Panel 2: Measured accel y vs predicted Coriolis (µg) ---
-        accel_ug = accel_mean * 1e6       # g → µg
-        sem_ug   = accel_sem * 1e6
-        a_cor_ug = a_cor_g * 1e6          # g → µg
-        cor_peak_ug = float(np.max(np.abs(a_cor_ug)))
-
-        ax2 = fig.add_subplot(3, 1, 2)
+        # --- Panel 2: measured accel y vs predicted Coriolis (µg) ---
         ax2.plot(phase_deg, accel_ug, "k-", lw=1.0,
-                 label="Measured accel y (µg)")
+                 label="Measured accel y")
         ax2.fill_between(phase_deg,
                          accel_ug - sem_ug, accel_ug + sem_ug,
                          alpha=0.3, color="C0",
                          label=f"±1 SEM (N={n_cycles})")
-        ax2.plot(phase_deg, a_cor_ug + np.mean(accel_ug),
+        ax2.plot(phase_deg,
+                 a_cor_ug + np.mean(accel_ug),
                  "g-", lw=1.2, alpha=0.85,
                  label=f"Predicted Coriolis (peak {cor_peak_ug:.4f} µg)")
-        ax2.set_ylabel("Acceleration y (µg)")
-        ax2.set_xlim(0, 360); ax2.grid(True, alpha=0.3)
-        mark_coriolis_region(ax2, waveform, phase_deg, duty)
+        ax2.set_ylabel("y accel\n(µg)", fontsize=9)
+        ax2.grid(True, alpha=0.3)
+        mark_coriolis_region(ax2, phase_deg, search_hw)
         ax2.legend(loc="upper right", fontsize=8)
 
-        # --- Panel 3: Residual accel y & Coriolis prediction (µg) ---
-        residual_ug = accel_ug - np.mean(accel_ug)
-        ax3 = fig.add_subplot(3, 1, 3)
+        # --- Panel 3: residual + Coriolis prediction (µg) ---
         ax3.plot(phase_deg, residual_ug, "k-", lw=1.0,
                  label="Residual (mean-subtracted)")
         ax3.fill_between(phase_deg,
@@ -944,24 +1093,42 @@ class ContinuousWidget(QWidget):
                          alpha=0.3, color="C0", label="±1 SEM")
         ax3.plot(phase_deg, a_cor_ug, "g-", lw=1.2, alpha=0.85,
                  label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
-        ax3.set_ylabel("Residual accel y (µg)")
+        ax3.set_ylabel("y res\n(µg)", fontsize=9)
         ax3.set_xlabel("Phase (degrees)")
-        ax3.set_xlim(0, 360); ax3.grid(True, alpha=0.3)
-        mark_coriolis_region(ax3, waveform, phase_deg, duty)
-        mean_abs, sem_avg, snr = compute_snr(
-            waveform, accel_mean, accel_sem, phase, duty)
-        v_peak = float(np.max(np.abs(v_mms)))
-        ax3.set_title(
-            f"v_peak = {v_peak:.2f} mm/s — "
-            f"Coriolis peak = {cor_peak_ug:.4f} µg — "
-            f"SEM = {sem_avg*1e6:.2e} µg — SNR = {snr:.1f}",
-            fontsize=9, color="darkblue")
+        ax3.grid(True, alpha=0.3)
+        mark_coriolis_region(ax3, phase_deg, search_hw)
+        if use_mf:
+            ax3.set_title(
+                f"v_peak = {v_peak:.2f} mm/s — "
+                f"MF amplitude = {mf_A_ug:.4f} ± {mf_sigma_ug:.4f} µg — "
+                f"SNR_MF = {snr_mf:.1f}",
+                fontsize=9, color="darkblue")
+        else:
+            ax3.set_title(
+                f"v_peak = {v_peak:.2f} mm/s — "
+                f"Coriolis peak = {cor_peak_ug:.4f} µg — "
+                f"SEM = {sem_avg*1e6:.2e} µg — SNR = {snr_region:.1f}",
+                fontsize=9, color="darkblue")
         ax3.legend(loc="upper right", fontsize=8)
 
-        canvas = FigureCanvasQTAgg(fig)
-        toolbar = NavigationToolbar2QT(canvas, self)
-        self._plot_layout.addWidget(toolbar)
-        self._plot_layout.addWidget(canvas)
+        # Apply log/linear
+        self._apply_scale()
+        self._canvas.draw_idle()
+
+    # --- internals --------------------------------------------------------
+    def _toggle_log(self, checked: bool):
+        self._log_scale = checked
+        self._log_btn.setText("Linear Y" if checked else "Log Y")
+        self._apply_scale()
+        self._canvas.draw_idle()
+
+    def _apply_scale(self):
+        scale = "log" if self._log_scale else "linear"
+        for ax in self._axes:
+            ax.set_yscale(scale)
+
+    def _on_snr_mode_changed(self):
+        self._draw()
 
 
 # ===================================================================
@@ -1172,6 +1339,15 @@ class ScanWidget(QWidget):
         self._n_bins_spin.setRange(64, 4096); self._n_bins_spin.setValue(N_PHASE_BINS)
         self._n_bins_spin.setSingleStep(64); self._n_bins_spin.setMaximumWidth(70)
         hr2.addWidget(self._n_bins_spin)
+        hr2.addWidget(QLabel("Search ±(°):"))
+        self._search_hw_spin = QDoubleSpinBox()
+        self._search_hw_spin.setRange(1.0, 89.0); self._search_hw_spin.setValue(60.0)
+        self._search_hw_spin.setDecimals(1); self._search_hw_spin.setSingleStep(5.0)
+        self._search_hw_spin.setMaximumWidth(60)
+        self._search_hw_spin.setToolTip(
+            "Half-width (degrees) of the search region centred on\n"
+            "0° and 180° (the velocity peaks).")
+        hr2.addWidget(self._search_hw_spin)
         hl.addLayout(hr2)
 
         hr3 = QHBoxLayout()
@@ -1564,8 +1740,8 @@ class ScanWidget(QWidget):
             if acc.count < 2:
                 continue
             _, _, snr = compute_snr(
-                wf, acc.mean, acc.sem, phase,
-                self._active_duty,
+                acc.mean, acc.sem, phase,
+                self._search_hw_spin.value(),
             )
             n_cyc = self._point_cycles.get((wf, amp, freq), 0)
             snr_data.append((wf, amp, freq, snr, n_cyc))
@@ -1642,8 +1818,8 @@ class ScanWidget(QWidget):
                     ax_t.plot(phase_deg, a_cor_ug, "g-", lw=1.2,
                               alpha=0.85,
                               label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
-                mark_coriolis_region(ax_t, self._active_waveform, phase_deg,
-                                    self._active_duty)
+                mark_coriolis_region(ax_t, phase_deg,
+                                    self._search_hw_spin.value())
                 wf, a, f = self._active_key
                 n_cyc = self._point_cycles.get(self._active_key, 0)
                 ax_t.set_title(
@@ -1676,8 +1852,10 @@ class Plugin(AnalysisPlugin):
         self._tabs = QTabWidget()
         self._cont_widget = ContinuousWidget(self)
         self._scan_widget = ScanWidget(self)
+        self._plot_widget = PlotWidget()
         self._tabs.addTab(self._cont_widget, "Continuous")
         self._tabs.addTab(self._scan_widget, "Scan")
+        self._tabs.addTab(self._plot_widget, "Plot")
         return self._tabs
 
     def on_file_written(self, filepath: str):
