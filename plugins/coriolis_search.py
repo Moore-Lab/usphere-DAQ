@@ -366,6 +366,50 @@ def matched_filter_snr(
     return A_hat, sigma_A, snr
 
 
+def multi_matched_filter(
+    accel_mean: NDArray, accel_sem: NDArray,
+    templates: dict[str, NDArray],
+) -> dict[str, tuple[float, float, float]]:
+    """Multi-component weighted least-squares matched filter.
+
+    Simultaneously fits  d = Σ_k A_k · t_k  to the mean-subtracted
+    data, weighted by 1/σ².  Returns dimensionless scale factors A_k
+    (A_k ≈ 1 means the data matches template k at expected amplitude).
+
+    Parameters
+    ----------
+    accel_mean : Phase-folded accelerometer mean (any consistent unit).
+    accel_sem  : Phase-folded SEM (same unit).
+    templates  : {name: template_array} in the same unit as *accel_mean*.
+
+    Returns
+    -------
+    {name: (A_hat, sigma_A, snr)} — A_hat is dimensionless.
+    """
+    if not templates:
+        return {}
+    d = accel_mean - np.mean(accel_mean)
+    sigma = np.maximum(accel_sem, 1e-30)
+    w = 1.0 / (sigma * sigma)
+    names = list(templates.keys())
+    T = np.column_stack([templates[n] - np.mean(templates[n]) for n in names])
+    TtW = T.T * w[np.newaxis, :]          # K × N
+    TtWT = TtW @ T                         # K × K
+    TtWd = TtW @ d                         # K
+    try:
+        cov = np.linalg.inv(TtWT)
+        A = cov @ TtWd
+    except np.linalg.LinAlgError:
+        return {n: (0.0, 0.0, 0.0) for n in names}
+    results = {}
+    for i, n in enumerate(names):
+        A_hat = float(A[i])
+        sigma_A = float(np.sqrt(max(cov[i, i], 0.0)))
+        snr = abs(A_hat) / sigma_A if sigma_A > 0 else 0.0
+        results[n] = (A_hat, sigma_A, snr)
+    return results
+
+
 def coriolis_sign(drive_dir: str, accel_dir: str) -> float:
     """Return the sign (+1 or -1) for  a_meas = sign * κ * |ẋ|.
 
@@ -987,6 +1031,13 @@ class ContinuousWidget(QWidget):
         a_cor_g, v_mms = coriolis_template(enc_mean, phase, T_s,
                                             sign=self._get_sign())
 
+        # Encoder acceleration & cross-talk template
+        dphi = phase[1] - phase[0] if len(phase) > 1 else 1.0
+        dt = dphi * T_s
+        enc_accel_mms2 = np.gradient(v_mms, dt)            # mm/s²
+        enc_accel_g = enc_accel_mms2 * 1e-3 / G_ACCEL      # → g
+        xtalk_g = 0.01 * enc_accel_g                        # 1% cross-talk
+
         accel_ug = accel_mean * 1e6       # g → µg
         sem_ug   = accel_sem * 1e6
         a_cor_ug = a_cor_g * 1e6          # g → µg
@@ -995,16 +1046,22 @@ class ContinuousWidget(QWidget):
         search_hw = self._search_hw_spin.value()
         mean_abs, sem_avg, snr_region = compute_snr(
             accel_mean, accel_sem, phase, search_hw)
-        mf_A, mf_sigma, snr_mf = matched_filter_snr(
-            accel_mean, accel_sem, a_cor_g)
         v_peak = float(np.max(np.abs(v_mms)))
+
+        mf_templates = {
+            "Coriolis (κẋ)": ("signal", a_cor_g),
+            "Cross-talk (1% ẍ)": ("background", xtalk_g),
+        }
 
         self._plugin._plot_widget.update(
             phase_deg=phase_deg,
             enc_mean=enc_mean,
             v_mms=v_mms,
+            enc_accel_mms2=enc_accel_mms2,
             accel_ug=accel_ug,
             sem_ug=sem_ug,
+            accel_mean_g=accel_mean,
+            accel_sem_g=accel_sem,
             a_cor_ug=a_cor_ug,
             residual_ug=residual_ug,
             cor_peak_ug=cor_peak_ug,
@@ -1016,9 +1073,7 @@ class ContinuousWidget(QWidget):
             mean_abs=mean_abs,
             sem_avg=sem_avg,
             snr_region=snr_region,
-            mf_A_ug=mf_A * 1e6,
-            mf_sigma_ug=mf_sigma * 1e6,
-            snr_mf=snr_mf,
+            mf_templates=mf_templates,
         )
 
 
@@ -1035,7 +1090,7 @@ class PlotWidget(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
 
-        # Toolbar row: log toggle + SNR mode
+        # Row 1: log toggle + SNR mode
         btn_row = QHBoxLayout()
         self._log_btn = QPushButton("Log Y")
         self._log_btn.setCheckable(True)
@@ -1056,6 +1111,20 @@ class PlotWidget(QWidget):
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
+        # Row 2: MF component checkboxes (visible only in MF mode)
+        mf_row = QHBoxLayout()
+        self._mf_comp_label = QLabel("  MF components:")
+        mf_row.addWidget(self._mf_comp_label)
+        self._mf_cb_container = QWidget()
+        self._mf_cb_layout = QHBoxLayout(self._mf_cb_container)
+        self._mf_cb_layout.setContentsMargins(0, 0, 0, 0)
+        mf_row.addWidget(self._mf_cb_container)
+        mf_row.addStretch()
+        lay.addLayout(mf_row)
+        self._mf_checkboxes: dict[str, QCheckBox] = {}
+        self._mf_comp_label.setVisible(False)
+        self._mf_cb_container.setVisible(False)
+
         # Persistent figure & canvas
         self._fig = Figure(tight_layout=True)
         self._axes = self._fig.subplots(3, 1, sharex=True)
@@ -1065,67 +1134,106 @@ class PlotWidget(QWidget):
         lay.addWidget(self._canvas, stretch=1)
 
         self._log_scale = False
-        self._last_kwargs = None   # stash for re-draw on mode toggle
+        self._last_kwargs = None
 
     # --- public -----------------------------------------------------------
-    def update(self, *, phase_deg, enc_mean, v_mms,
-               accel_ug, sem_ug, a_cor_ug, residual_ug, cor_peak_ug,
+    def update(self, *, phase_deg, enc_mean, v_mms, enc_accel_mms2,
+               accel_ug, sem_ug, accel_mean_g, accel_sem_g,
+               a_cor_ug, residual_ug, cor_peak_ug,
                search_hw, waveform, n_cycles, T_s, v_peak,
                mean_abs, sem_avg, snr_region,
-               mf_A_ug, mf_sigma_ug, snr_mf):
+               mf_templates):
+        """mf_templates: {name: (kind, template_g_array)}"""
         self._last_kwargs = dict(
             phase_deg=phase_deg, enc_mean=enc_mean, v_mms=v_mms,
-            accel_ug=accel_ug, sem_ug=sem_ug, a_cor_ug=a_cor_ug,
-            residual_ug=residual_ug, cor_peak_ug=cor_peak_ug,
+            enc_accel_mms2=enc_accel_mms2,
+            accel_ug=accel_ug, sem_ug=sem_ug,
+            accel_mean_g=accel_mean_g, accel_sem_g=accel_sem_g,
+            a_cor_ug=a_cor_ug, residual_ug=residual_ug,
+            cor_peak_ug=cor_peak_ug,
             search_hw=search_hw, waveform=waveform, n_cycles=n_cycles,
             T_s=T_s, v_peak=v_peak, mean_abs=mean_abs, sem_avg=sem_avg,
-            snr_region=snr_region, mf_A_ug=mf_A_ug,
-            mf_sigma_ug=mf_sigma_ug, snr_mf=snr_mf,
+            snr_region=snr_region, mf_templates=mf_templates,
         )
+        self._sync_mf_checkboxes(list(mf_templates.keys()))
         self._draw()
+
+    # --- internals --------------------------------------------------------
+    def _sync_mf_checkboxes(self, names: list[str]):
+        old = list(self._mf_checkboxes.keys())
+        if names == old:
+            return
+        checked = {n: cb.isChecked() for n, cb in self._mf_checkboxes.items()}
+        for cb in self._mf_checkboxes.values():
+            self._mf_cb_layout.removeWidget(cb)
+            cb.deleteLater()
+        self._mf_checkboxes.clear()
+        for name in names:
+            cb = QCheckBox(name)
+            cb.setChecked(checked.get(name, True))
+            cb.toggled.connect(self._on_snr_mode_changed)
+            self._mf_cb_layout.addWidget(cb)
+            self._mf_checkboxes[name] = cb
+        use_mf = self._snr_mf_rb.isChecked()
+        self._mf_comp_label.setVisible(use_mf)
+        self._mf_cb_container.setVisible(use_mf)
 
     def _draw(self):
         if self._last_kwargs is None:
             return
         kw = self._last_kwargs
         phase_deg = kw["phase_deg"]; enc_mean = kw["enc_mean"]
-        v_mms = kw["v_mms"]; accel_ug = kw["accel_ug"]
-        sem_ug = kw["sem_ug"]; a_cor_ug = kw["a_cor_ug"]
+        v_mms = kw["v_mms"]; enc_accel_mms2 = kw["enc_accel_mms2"]
+        accel_ug = kw["accel_ug"]; sem_ug = kw["sem_ug"]
+        accel_mean_g = kw["accel_mean_g"]; accel_sem_g = kw["accel_sem_g"]
+        a_cor_ug = kw["a_cor_ug"]
         residual_ug = kw["residual_ug"]; cor_peak_ug = kw["cor_peak_ug"]
         search_hw = kw["search_hw"]; waveform = kw["waveform"]
         n_cycles = kw["n_cycles"]; T_s = kw["T_s"]
         v_peak = kw["v_peak"]; mean_abs = kw["mean_abs"]
         sem_avg = kw["sem_avg"]; snr_region = kw["snr_region"]
-        mf_A_ug = kw["mf_A_ug"]; mf_sigma_ug = kw["mf_sigma_ug"]
-        snr_mf = kw["snr_mf"]
+        mf_templates = kw["mf_templates"]
         use_mf = self._snr_mf_rb.isChecked()
 
         ax1, ax2, ax3 = self._axes
         for ax in self._axes:
             ax.clear()
 
-        # --- Panel 1: encoder position + velocity twin axis ---
-        ax1.plot(phase_deg, enc_mean, "b-", lw=1.2,
-                 label="Position (mm)")
+        # Remove stale twin axes
+        for a in self._fig.axes:
+            if a not in self._axes:
+                a.remove()
+
+        # --- Panel 1: encoder position + velocity + acceleration ---
+        ax1.plot(phase_deg, enc_mean, "b-", lw=1.2, label="Position (mm)")
         ax1.set_ylabel("x pos\n(mm)", fontsize=9)
         ax1.set_title(
             f"Phase-folded template — {n_cycles} cycles — {waveform}"
             f" — T = {T_s:.3f} s ({1/T_s:.2f} Hz)",
             fontsize=11)
-        ax1.legend(loc="upper right", fontsize=8)
+        ax1.legend(loc="upper left", fontsize=8)
         ax1.set_xlim(0, 360)
         ax1.grid(True, alpha=0.3)
 
-        # Twin velocity axis (recreate each time since clear() removes it)
-        for a in self._fig.axes:
-            if a not in self._axes:
-                a.remove()
+        # Velocity twin axis
         ax1v = ax1.twinx()
         ax1v.plot(phase_deg, v_mms, "r--", alpha=0.6, lw=0.9,
                   label="Velocity (mm/s)")
         ax1v.set_ylabel("ẋ\n(mm/s)", color="r", fontsize=9)
         ax1v.tick_params(axis="y", colors="r", labelsize=7)
-        ax1v.legend(loc="lower right", fontsize=8)
+
+        # Acceleration twin axis (offset to the right)
+        ax1a = ax1.twinx()
+        ax1a.spines["right"].set_position(("outward", 55))
+        ax1a.plot(phase_deg, enc_accel_mms2, "g:", alpha=0.5, lw=0.8,
+                  label="Accel (mm/s²)")
+        ax1a.set_ylabel("ẍ\n(mm/s²)", color="green", fontsize=8)
+        ax1a.tick_params(axis="y", colors="green", labelsize=6)
+
+        # Combined legend for right-side axes
+        h1, l1 = ax1v.get_legend_handles_labels()
+        h2, l2 = ax1a.get_legend_handles_labels()
+        ax1v.legend(h1 + h2, l1 + l2, loc="lower right", fontsize=7)
 
         # --- Panel 2: measured accel y vs predicted Coriolis (µg) ---
         ax2.plot(phase_deg, accel_ug, "k-", lw=1.0,
@@ -1143,29 +1251,62 @@ class PlotWidget(QWidget):
         mark_coriolis_region(ax2, phase_deg, search_hw)
         ax2.legend(loc="upper right", fontsize=8)
 
-        # --- Panel 3: residual + Coriolis prediction (µg) ---
+        # --- Panel 3: residual + MF / region-avg ---
         ax3.plot(phase_deg, residual_ug, "k-", lw=1.0,
                  label="Residual (mean-subtracted)")
         ax3.fill_between(phase_deg,
                          residual_ug - sem_ug, residual_ug + sem_ug,
                          alpha=0.3, color="C0", label="±1 SEM")
         if use_mf:
-            # Scale template to matched-filter best-fit amplitude
-            t = a_cor_ug.copy()
-            t_norm = np.max(np.abs(t))
-            if t_norm > 0:
-                mf_fit_ug = t * (mf_A_ug / t_norm)
+            # Gather checked templates
+            active = {}
+            for name, cb in self._mf_checkboxes.items():
+                if cb.isChecked() and name in mf_templates:
+                    active[name] = mf_templates[name][1]  # template in g
+            if active:
+                results = multi_matched_filter(
+                    accel_mean_g, accel_sem_g, active)
+                _MF_COLORS = ["green", "orange", "purple",
+                              "brown", "deeppink"]
+                total_fit_ug = np.zeros_like(residual_ug)
+                sig_snr = sig_peak = sig_sigma = None
+                for i, (name, template_g) in enumerate(active.items()):
+                    A_hat, sigma_A, snr_i = results[name]
+                    template_ug = template_g * 1e6
+                    fitted_ug = A_hat * template_ug
+                    t_peak = float(np.max(np.abs(template_ug)))
+                    peak_ug = A_hat * t_peak
+                    sigma_peak_ug = sigma_A * t_peak
+                    total_fit_ug += fitted_ug
+                    c = _MF_COLORS[i % len(_MF_COLORS)]
+                    kind = mf_templates[name][0]
+                    tag = "S" if kind == "signal" else "B"
+                    ax3.plot(phase_deg, fitted_ug, "-", color=c, lw=1.0,
+                             alpha=0.8,
+                             label=(f"[{tag}] {name}: "
+                                    f"{peak_ug:.4f}±{sigma_peak_ug:.4f} µg"))
+                    if kind == "signal" and sig_snr is None:
+                        sig_snr = snr_i
+                        sig_peak = peak_ug
+                        sig_sigma = sigma_peak_ug
+                ax3.plot(phase_deg, total_fit_ug, "m-", lw=1.5,
+                         alpha=0.9, label="Total MF fit")
+                if sig_snr is not None:
+                    ax3.set_title(
+                        f"v_peak = {v_peak:.2f} mm/s — "
+                        f"Signal = {sig_peak:.4f} ± {sig_sigma:.4f} µg — "
+                        f"SNR = {sig_snr:.1f}",
+                        fontsize=9, color="darkblue")
+                else:
+                    ax3.set_title(
+                        f"v_peak = {v_peak:.2f} mm/s — "
+                        f"MF (no signal component selected)",
+                        fontsize=9, color="darkblue")
             else:
-                mf_fit_ug = t
-            ax3.plot(phase_deg, mf_fit_ug, "m-", lw=1.4, alpha=0.9,
-                     label=f"MF best fit ({mf_A_ug:.4f} ± {mf_sigma_ug:.4f} µg)")
-            ax3.plot(phase_deg, a_cor_ug, "g--", lw=0.8, alpha=0.45,
-                     label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
-            ax3.set_title(
-                f"v_peak = {v_peak:.2f} mm/s — "
-                f"MF amplitude = {mf_A_ug:.4f} ± {mf_sigma_ug:.4f} µg — "
-                f"SNR_MF = {snr_mf:.1f}",
-                fontsize=9, color="darkblue")
+                ax3.set_title(
+                    f"v_peak = {v_peak:.2f} mm/s — "
+                    f"(no MF components selected)",
+                    fontsize=9, color="gray")
         else:
             ax3.plot(phase_deg, a_cor_ug, "g-", lw=1.2, alpha=0.85,
                      label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
@@ -1178,13 +1319,12 @@ class PlotWidget(QWidget):
         ax3.set_ylabel("y res\n(µg)", fontsize=9)
         ax3.set_xlabel("Phase (degrees)")
         ax3.grid(True, alpha=0.3)
-        ax3.legend(loc="upper right", fontsize=8)
+        ax3.legend(loc="upper right", fontsize=7)
 
         # Apply log/linear
         self._apply_scale()
         self._canvas.draw_idle()
 
-    # --- internals --------------------------------------------------------
     def _toggle_log(self, checked: bool):
         self._log_scale = checked
         self._log_btn.setText("Linear Y" if checked else "Log Y")
@@ -1196,7 +1336,10 @@ class PlotWidget(QWidget):
         for ax in self._axes:
             ax.set_yscale(scale)
 
-    def _on_snr_mode_changed(self):
+    def _on_snr_mode_changed(self, *_args):
+        use_mf = self._snr_mf_rb.isChecked()
+        self._mf_comp_label.setVisible(use_mf)
+        self._mf_cb_container.setVisible(use_mf)
         self._draw()
 
 
