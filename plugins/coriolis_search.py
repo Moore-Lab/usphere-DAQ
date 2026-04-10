@@ -105,6 +105,12 @@ def _save_esp_position(pos_mm: float) -> None:
 # ---------------------------------------------------------------------------
 N_PHASE_BINS = 512
 
+# Physical constants for Coriolis acceleration projection
+OMEGA_EARTH = 7.292e-5     # rad/s  — Earth's angular rotation rate
+LATITUDE_DEG = 41.3        # degrees — Yale University, New Haven CT
+KAPPA = 2 * OMEGA_EARTH * math.sin(math.radians(LATITUDE_DEG))  # ≈ 9.61e-5 rad/s
+G_ACCEL = 9.80665          # m/s²  — standard gravitational acceleration
+
 _WAVE_FIRMWARE = {"Sine": "SINE", "Triangle": "TRAP", "Rounded Triangle": "SCURVE"}
 
 
@@ -287,23 +293,36 @@ def compute_snr(
 
 
 def coriolis_template(
-    enc_mean: NDArray, phase: NDArray, fs_approx: float | None = None,
-) -> NDArray:
-    """Compute the expected Coriolis acceleration shape from the encoder.
+    enc_mean_mm: NDArray, phase: NDArray, cycle_period_s: float,
+) -> tuple[NDArray, NDArray]:
+    """Predicted Coriolis acceleration from the phase-folded encoder.
 
-    The Coriolis acceleration is proportional to velocity:
-        a_Cor = 2 * Omega x v
-    So its *shape* vs. phase is just d(position)/d(phase).  We return
-    this normalised to unit amplitude (zero-mean, peak = 1) so it can
-    be scaled/overlaid on measured data.
+    The table moves east/west (x-direction) with position recorded by
+    the encoder.  The Coriolis acceleration in the perpendicular
+    horizontal direction (y) is:
+
+        a_Cor(t) = κ · v_table(t)          (coriolis_sensitivity.md §1)
+
+    where κ = 2 Ω_⊕ sin λ ≈ 9.61 × 10⁻⁵ rad/s at Yale.
+
+    Parameters
+    ----------
+    enc_mean_mm    : Phase-folded encoder position [mm].
+    phase          : Phase grid (0 to 1, N_PHASE_BINS points).
+    cycle_period_s : Mean oscillation period [s].
+
+    Returns
+    -------
+    a_cor_g : Predicted Coriolis acceleration [g].
+    v_mms   : Table velocity [mm/s].
     """
     dphi = phase[1] - phase[0] if len(phase) > 1 else 1.0
-    vel = np.gradient(enc_mean, dphi)
-    vel = vel - np.mean(vel)
-    peak = np.max(np.abs(vel))
-    if peak > 0:
-        vel /= peak
-    return vel
+    dt = dphi * cycle_period_s                        # seconds per phase bin
+    v_mms = np.gradient(enc_mean_mm, dt)              # mm/s
+    v_ms  = v_mms * 1e-3                              # m/s
+    a_cor_ms2 = KAPPA * v_ms                          # m/s²
+    a_cor_g   = a_cor_ms2 / G_ACCEL                   # g
+    return a_cor_g, v_mms
 
 
 # ===================================================================
@@ -320,6 +339,8 @@ class ContinuousWidget(QWidget):
         self._accel_acc = TemplateAccumulator()
         self._encoder_acc = TemplateAccumulator()
         self._total_cycles = 0
+        self._mean_period_s = 0.0
+        self._period_count = 0
         self._live = False
         self._init_ui()
 
@@ -673,6 +694,8 @@ class ContinuousWidget(QWidget):
         self._accel_acc = TemplateAccumulator(n_bins)
         self._encoder_acc = TemplateAccumulator(n_bins)
         self._total_cycles = 0
+        self._mean_period_s = 0.0
+        self._period_count = 0
         self._cycle_lbl.setText("Cycles: 0")
         self._clear_plots()
         self._log("Template reset.")
@@ -723,6 +746,9 @@ class ContinuousWidget(QWidget):
         for s, e in cycles:
             self._accel_acc.add_cycle(phase_fold(accel_g, s, e, n_bins))
             self._encoder_acc.add_cycle(phase_fold(encoder_filt, s, e, n_bins))
+            period = (e - s) / fs
+            self._period_count += 1
+            self._mean_period_s += (period - self._mean_period_s) / self._period_count
         self._total_cycles += len(cycles)
         self._cycle_lbl.setText(f"Cycles: {self._total_cycles}")
         self._log(f"  {Path(filepath).name}: +{len(cycles)} cycles "
@@ -744,64 +770,80 @@ class ContinuousWidget(QWidget):
         n_bins = self._accel_acc.n_bins
         phase = np.linspace(0.0, 1.0, n_bins, endpoint=False)
         phase_deg = phase * 360.0
-        accel_mean = self._accel_acc.mean
-        accel_sem = self._accel_acc.sem
-        enc_mean = self._encoder_acc.mean
+        accel_mean = self._accel_acc.mean   # g
+        accel_sem = self._accel_acc.sem     # g
+        enc_mean = self._encoder_acc.mean   # mm
         n_cycles = self._accel_acc.count
         waveform = self._wave_combo.currentText()
         duty = self._duty_spin.value()
+        T_s = self._mean_period_s if self._mean_period_s > 0 else 1.0
+
+        # Physical Coriolis prediction from encoder velocity
+        a_cor_g, v_mms = coriolis_template(enc_mean, phase, T_s)
 
         fig = Figure(figsize=(10, 8), tight_layout=True)
 
+        # --- Panel 1: Encoder position (mm) & table velocity (mm/s) ---
         ax1 = fig.add_subplot(3, 1, 1)
-        ax1.plot(phase_deg, enc_mean, "b-", lw=1.2, label="Position (mm)")
-        ax1.set_ylabel("Position (mm)")
-        ax1.set_title(f"Phase-folded template  —  {n_cycles} cycles  —  {waveform}",
-                       fontsize=11)
+        ax1.plot(phase_deg, enc_mean, "b-", lw=1.2,
+                 label="Table position x (mm)")
+        ax1.set_ylabel("Table position x (mm)")
+        ax1.set_title(
+            f"Phase-folded template — {n_cycles} cycles — {waveform}"
+            f" — T = {T_s:.3f} s ({1/T_s:.2f} Hz)",
+            fontsize=11)
         ax1.legend(loc="upper right", fontsize=8)
         ax1.set_xlim(0, 360); ax1.grid(True, alpha=0.3)
         ax1v = ax1.twinx()
-        dphi = phase[1] - phase[0] if len(phase) > 1 else 1.0
-        vel = np.gradient(enc_mean, dphi)
-        vel_norm = vel / (np.max(np.abs(vel)) + 1e-30)
-        ax1v.plot(phase_deg, vel_norm, "r--", alpha=0.6, lw=0.9, label="Velocity (norm)")
-        ax1v.set_ylabel("Velocity (normalised)", color="r", fontsize=8)
+        ax1v.plot(phase_deg, v_mms, "r--", alpha=0.6, lw=0.9,
+                  label="Velocity ẋ (mm/s)")
+        ax1v.set_ylabel("Table velocity ẋ (mm/s)", color="r", fontsize=8)
         ax1v.tick_params(axis="y", colors="r", labelsize=7)
         ax1v.legend(loc="lower right", fontsize=8)
 
-        # Expected Coriolis shape from encoder velocity
-        cor_shape = coriolis_template(enc_mean, phase)
+        # --- Panel 2: Measured accel y vs predicted Coriolis (µg) ---
+        accel_ug = accel_mean * 1e6       # g → µg
+        sem_ug   = accel_sem * 1e6
+        a_cor_ug = a_cor_g * 1e6          # g → µg
+        cor_peak_ug = float(np.max(np.abs(a_cor_ug)))
 
         ax2 = fig.add_subplot(3, 1, 2)
-        ax2.plot(phase_deg, accel_mean, "k-", lw=1.0, label="Accel mean (g)")
-        ax2.fill_between(phase_deg, accel_mean - accel_sem, accel_mean + accel_sem,
-                         alpha=0.3, color="C0", label=f"±1 SEM (N={n_cycles})")
-        # Overlay expected Coriolis scaled to match accel amplitude
-        accel_range = np.max(np.abs(accel_mean - np.mean(accel_mean)))
-        if accel_range > 0:
-            ax2.plot(phase_deg, cor_shape * accel_range + np.mean(accel_mean),
-                     "g--", lw=1.0, alpha=0.7, label="Expected Coriolis (scaled)")
-        ax2.set_ylabel("Acceleration (g)"); ax2.set_xlim(0, 360); ax2.grid(True, alpha=0.3)
+        ax2.plot(phase_deg, accel_ug, "k-", lw=1.0,
+                 label="Measured accel y (µg)")
+        ax2.fill_between(phase_deg,
+                         accel_ug - sem_ug, accel_ug + sem_ug,
+                         alpha=0.3, color="C0",
+                         label=f"±1 SEM (N={n_cycles})")
+        ax2.plot(phase_deg, a_cor_ug + np.mean(accel_ug),
+                 "g-", lw=1.2, alpha=0.85,
+                 label=f"Predicted Coriolis (peak {cor_peak_ug:.4f} µg)")
+        ax2.set_ylabel("Acceleration y (µg)")
+        ax2.set_xlim(0, 360); ax2.grid(True, alpha=0.3)
         mark_coriolis_region(ax2, waveform, phase_deg, duty)
         ax2.legend(loc="upper right", fontsize=8)
 
+        # --- Panel 3: Residual accel y & Coriolis prediction (µg) ---
+        residual_ug = accel_ug - np.mean(accel_ug)
         ax3 = fig.add_subplot(3, 1, 3)
-        residual = accel_mean - np.mean(accel_mean)
-        ax3.plot(phase_deg, residual, "k-", lw=1.0, label="Residual (mean-subtracted)")
-        ax3.fill_between(phase_deg, residual - accel_sem, residual + accel_sem,
+        ax3.plot(phase_deg, residual_ug, "k-", lw=1.0,
+                 label="Residual (mean-subtracted)")
+        ax3.fill_between(phase_deg,
+                         residual_ug - sem_ug, residual_ug + sem_ug,
                          alpha=0.3, color="C0", label="±1 SEM")
-        # Overlay expected Coriolis scaled to residual amplitude
-        res_range = np.max(np.abs(residual))
-        if res_range > 0:
-            ax3.plot(phase_deg, cor_shape * res_range,
-                     "g--", lw=1.0, alpha=0.7, label="Expected Coriolis (scaled)")
-        ax3.set_ylabel("Residual accel (g)"); ax3.set_xlabel("Phase (degrees)")
+        ax3.plot(phase_deg, a_cor_ug, "g-", lw=1.2, alpha=0.85,
+                 label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
+        ax3.set_ylabel("Residual accel y (µg)")
+        ax3.set_xlabel("Phase (degrees)")
         ax3.set_xlim(0, 360); ax3.grid(True, alpha=0.3)
         mark_coriolis_region(ax3, waveform, phase_deg, duty)
-        mean_abs, sem_avg, snr = compute_snr(waveform, accel_mean, accel_sem, phase, duty)
-        ax3.set_title(f"Coriolis region: |mean|={mean_abs:.2e} g, "
-                      f"SEM={sem_avg:.2e} g, SNR={snr:.1f}",
-                      fontsize=9, color="darkblue")
+        mean_abs, sem_avg, snr = compute_snr(
+            waveform, accel_mean, accel_sem, phase, duty)
+        v_peak = float(np.max(np.abs(v_mms)))
+        ax3.set_title(
+            f"v_peak = {v_peak:.2f} mm/s — "
+            f"Coriolis peak = {cor_peak_ug:.4f} µg — "
+            f"SEM = {sem_avg*1e6:.2e} µg — SNR = {snr:.1f}",
+            fontsize=9, color="darkblue")
         ax3.legend(loc="upper right", fontsize=8)
 
         canvas = FigureCanvasQTAgg(fig)
@@ -924,6 +966,7 @@ class ScanWidget(QWidget):
         self._point_accs: dict[tuple[str, float, float], TemplateAccumulator] = {}
         self._point_enc_accs: dict[tuple[str, float, float], TemplateAccumulator] = {}
         self._point_cycles: dict[tuple[str, float, float], int] = {}
+        self._point_periods: dict[tuple[str, float, float], tuple[float, int]] = {}
         self._active_key: tuple[str, float, float] | None = None
         self._active_waveform: str = "Sine"
         self._active_duty: float = 0.9
@@ -1288,6 +1331,7 @@ class ScanWidget(QWidget):
         self._point_accs.clear()
         self._point_enc_accs.clear()
         self._point_cycles.clear()
+        self._point_periods.clear()
         self._active_key = None
 
         n_files = self._nfiles_spin.value()
@@ -1324,6 +1368,7 @@ class ScanWidget(QWidget):
             self._point_accs[key] = TemplateAccumulator(self._n_bins)
             self._point_enc_accs[key] = TemplateAccumulator(self._n_bins)
             self._point_cycles[key] = 0
+            self._point_periods[key] = (0.0, 0)
 
     def _on_request_recording(self, basename):
         self._plugin.daq.start_recording(n_files=1, basename=basename)
@@ -1370,9 +1415,14 @@ class ScanWidget(QWidget):
 
         acc = self._point_accs[key]
         enc_acc = self._point_enc_accs[key]
+        mean_p, p_count = self._point_periods.get(key, (0.0, 0))
         for s, e in cycles:
             acc.add_cycle(phase_fold(accel_g, s, e, self._n_bins))
             enc_acc.add_cycle(phase_fold(encoder_filt, s, e, self._n_bins))
+            period = (e - s) / fs
+            p_count += 1
+            mean_p += (period - mean_p) / p_count
+        self._point_periods[key] = (mean_p, p_count)
         self._point_cycles[key] = self._point_cycles.get(key, 0) + len(cycles)
 
         self._log(f"  {Path(filepath).name}: +{len(cycles)} cycles for "
@@ -1459,30 +1509,36 @@ class ScanWidget(QWidget):
         if self._active_key and self._active_key in self._point_accs:
             acc = self._point_accs[self._active_key]
             enc_acc = self._point_enc_accs.get(self._active_key)
+            mean_p, _ = self._point_periods.get(self._active_key, (1.0, 0))
+            T_s = mean_p if mean_p > 0 else 1.0
             if acc.count >= 2:
                 ax_t = fig.add_subplot(n_waves + 1, 1, n_waves + 1)
                 phase_deg = phase * 360.0
-                residual = acc.mean - np.mean(acc.mean)
-                ax_t.plot(phase_deg, residual, "k-", lw=1.0, label="Residual")
-                ax_t.fill_between(phase_deg, residual - acc.sem, residual + acc.sem,
+                residual_ug = (acc.mean - np.mean(acc.mean)) * 1e6  # g → µg
+                sem_ug = acc.sem * 1e6
+                ax_t.plot(phase_deg, residual_ug, "k-", lw=1.0,
+                          label="Residual y (µg)")
+                ax_t.fill_between(phase_deg,
+                                  residual_ug - sem_ug, residual_ug + sem_ug,
                                   alpha=0.3, color="C0", label="±1 SEM")
-                # Overlay expected Coriolis shape from encoder
+                # Overlay calibrated Coriolis prediction from encoder
                 if enc_acc is not None and enc_acc.count >= 2:
-                    cor_shape = coriolis_template(enc_acc.mean, phase)
-                    res_range = np.max(np.abs(residual))
-                    if res_range > 0:
-                        ax_t.plot(phase_deg, cor_shape * res_range,
-                                  "g--", lw=1.0, alpha=0.7,
-                                  label="Expected Coriolis (scaled)")
+                    a_cor_g, v_mms = coriolis_template(
+                        enc_acc.mean, phase, T_s)
+                    a_cor_ug = a_cor_g * 1e6
+                    cor_peak_ug = float(np.max(np.abs(a_cor_ug)))
+                    ax_t.plot(phase_deg, a_cor_ug, "g-", lw=1.2,
+                              alpha=0.85,
+                              label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
                 mark_coriolis_region(ax_t, self._active_waveform, phase_deg,
                                     self._active_duty)
                 wf, a, f = self._active_key
                 n_cyc = self._point_cycles.get(self._active_key, 0)
                 ax_t.set_title(
                     f"Active: {wf} A={a:.3f} mm f={f:.3f} Hz  "
-                    f"({n_cyc} cycles)", fontsize=10)
+                    f"({n_cyc} cycles) — T = {T_s:.3f} s", fontsize=10)
                 ax_t.set_xlabel("Phase (degrees)")
-                ax_t.set_ylabel("Residual accel (g)")
+                ax_t.set_ylabel("Residual accel y (µg)")
                 ax_t.set_xlim(0, 360); ax_t.grid(True, alpha=0.3)
                 ax_t.legend(loc="upper right", fontsize=8)
 
