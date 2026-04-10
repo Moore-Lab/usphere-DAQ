@@ -20,6 +20,7 @@ template.  A summary heatmap of SNR vs. parameters is updated live.
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import time
@@ -71,6 +72,32 @@ def _get_stepper_controller_class():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.StepperController, mod.find_esp32_port
+
+
+_SETTINGS_FILE = _ESP_DIR / "settings.json"
+
+
+def _load_esp_position() -> float:
+    """Read last_position_mm from the ESP32 settings.json."""
+    try:
+        with open(_SETTINGS_FILE) as f:
+            return json.load(f).get("last_position_mm", 0.0)
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        return 0.0
+
+
+def _save_esp_position(pos_mm: float) -> None:
+    """Update last_position_mm in the ESP32 settings.json."""
+    try:
+        data = {}
+        if _SETTINGS_FILE.exists():
+            with open(_SETTINGS_FILE) as f:
+                data = json.load(f)
+        data["last_position_mm"] = pos_mm
+        with open(_SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except (IOError, json.JSONDecodeError):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -301,19 +328,44 @@ class ContinuousWidget(QWidget):
 
         # --- ESP32 Connection ---
         conn_grp = QGroupBox("ESP32 Connection")
-        conn_lay = QHBoxLayout(conn_grp)
-        conn_lay.addWidget(QLabel("Port:"))
+        conn_lay = QVBoxLayout(conn_grp)
+        cr1 = QHBoxLayout()
+        cr1.addWidget(QLabel("Port:"))
         self._port_edit = QLineEdit()
         self._port_edit.setPlaceholderText("Auto-detect")
         self._port_edit.setMaximumWidth(120)
-        conn_lay.addWidget(self._port_edit)
+        cr1.addWidget(self._port_edit)
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._toggle_connect)
-        conn_lay.addWidget(self._connect_btn)
+        cr1.addWidget(self._connect_btn)
         self._conn_status = QLabel("Disconnected")
         self._conn_status.setStyleSheet("color: gray;")
-        conn_lay.addWidget(self._conn_status)
-        conn_lay.addStretch()
+        cr1.addWidget(self._conn_status)
+        cr1.addStretch()
+        conn_lay.addLayout(cr1)
+        cr2 = QHBoxLayout()
+        self._pos_label = QLabel("Position: — mm")
+        self._pos_label.setStyleSheet("font-weight: bold;")
+        cr2.addWidget(self._pos_label)
+        self._zero_btn = QPushButton("Zero")
+        self._zero_btn.setToolTip("Set current position as zero reference")
+        self._zero_btn.clicked.connect(self._on_zero)
+        cr2.addWidget(self._zero_btn)
+        self._go_home_btn = QPushButton("Go Home")
+        self._go_home_btn.setToolTip("Move motor to position 0")
+        self._go_home_btn.clicked.connect(self._on_go_home)
+        cr2.addWidget(self._go_home_btn)
+        cr2.addWidget(QLabel("Move to (mm):"))
+        self._move_to_spin = QDoubleSpinBox()
+        self._move_to_spin.setRange(-100.0, 100.0); self._move_to_spin.setValue(0.0)
+        self._move_to_spin.setDecimals(4); self._move_to_spin.setSingleStep(0.1)
+        self._move_to_spin.setMaximumWidth(90)
+        cr2.addWidget(self._move_to_spin)
+        self._move_to_btn = QPushButton("Move")
+        self._move_to_btn.clicked.connect(self._on_move_to)
+        cr2.addWidget(self._move_to_btn)
+        cr2.addStretch()
+        conn_lay.addLayout(cr2)
         top.addWidget(conn_grp)
 
         # --- Motor Control ---
@@ -481,6 +533,7 @@ class ContinuousWidget(QWidget):
             self._connect_btn.setText("Connect")
             self._conn_status.setText("Disconnected")
             self._conn_status.setStyleSheet("color: gray;")
+            self._pos_label.setText("Position: — mm")
             self._log("ESP32 disconnected.")
             return
         try:
@@ -498,10 +551,52 @@ class ContinuousWidget(QWidget):
             self._connect_btn.setText("Disconnect")
             self._conn_status.setText(f"Connected ({port})")
             self._conn_status.setStyleSheet("color: green; font-weight: bold;")
+            # Restore last known position
+            last_pos = _load_esp_position()
+            if last_pos != 0.0:
+                self._ctrl.set_position(last_pos)
+                self._log(f"Restored position: {last_pos:.4f} mm")
+            self._pos_label.setText(f"Position: {last_pos:.4f} mm")
             self._log(f"Connected to ESP32 on {port}")
         except Exception as exc:
             self._log(f"Connection error: {exc}")
             self._ctrl = None
+
+    # ---- Position / motion ----
+    def _on_zero(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first.")
+            return
+        self._ctrl.zero()
+        self._pos_label.setText("Position: 0.0000 mm")
+        _save_esp_position(0.0)
+        self._log("Zeroed position.")
+
+    def _on_go_home(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first.")
+            return
+        self._ctrl.go_home()
+        self._pos_label.setText("Position: 0.0000 mm (homing…)")
+        _save_esp_position(0.0)
+        self._log("Going home (moving to 0).")
+
+    def _on_move_to(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first.")
+            return
+        target = self._move_to_spin.value()
+        # go_home then move — or just use MOVE as relative offset from current.
+        # We read the current pos from the label, compute delta.
+        cur = _load_esp_position()
+        delta = target - cur
+        if abs(delta) < 1e-6:
+            self._log("Already at target position.")
+            return
+        self._ctrl.move(delta)
+        self._pos_label.setText(f"Position: {target:.4f} mm (moving…)")
+        _save_esp_position(target)
+        self._log(f"Moving to {target:.4f} mm (delta={delta:+.4f} mm).")
 
     # ---- Motor control ----
     def _apply_and_start_motor(self):
@@ -842,19 +937,44 @@ class ScanWidget(QWidget):
 
         # --- ESP32 connection ---
         conn = QGroupBox("ESP32 Connection")
-        cl = QHBoxLayout(conn)
-        cl.addWidget(QLabel("Port:"))
+        cl = QVBoxLayout(conn)
+        cr1 = QHBoxLayout()
+        cr1.addWidget(QLabel("Port:"))
         self._port_edit = QLineEdit()
         self._port_edit.setPlaceholderText("Auto-detect")
         self._port_edit.setMaximumWidth(120)
-        cl.addWidget(self._port_edit)
+        cr1.addWidget(self._port_edit)
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._toggle_connect)
-        cl.addWidget(self._connect_btn)
+        cr1.addWidget(self._connect_btn)
         self._conn_status = QLabel("Disconnected")
         self._conn_status.setStyleSheet("color: gray;")
-        cl.addWidget(self._conn_status)
-        cl.addStretch()
+        cr1.addWidget(self._conn_status)
+        cr1.addStretch()
+        cl.addLayout(cr1)
+        cr2 = QHBoxLayout()
+        self._pos_label = QLabel("Position: — mm")
+        self._pos_label.setStyleSheet("font-weight: bold;")
+        cr2.addWidget(self._pos_label)
+        self._zero_btn = QPushButton("Zero")
+        self._zero_btn.setToolTip("Set current position as zero reference")
+        self._zero_btn.clicked.connect(self._on_zero)
+        cr2.addWidget(self._zero_btn)
+        self._go_home_btn = QPushButton("Go Home")
+        self._go_home_btn.setToolTip("Move motor to position 0")
+        self._go_home_btn.clicked.connect(self._on_go_home)
+        cr2.addWidget(self._go_home_btn)
+        cr2.addWidget(QLabel("Move to (mm):"))
+        self._move_to_spin = QDoubleSpinBox()
+        self._move_to_spin.setRange(-100.0, 100.0); self._move_to_spin.setValue(0.0)
+        self._move_to_spin.setDecimals(4); self._move_to_spin.setSingleStep(0.1)
+        self._move_to_spin.setMaximumWidth(90)
+        cr2.addWidget(self._move_to_spin)
+        self._move_to_btn = QPushButton("Move")
+        self._move_to_btn.clicked.connect(self._on_move_to)
+        cr2.addWidget(self._move_to_btn)
+        cr2.addStretch()
+        cl.addLayout(cr2)
         root.addWidget(conn)
 
         # --- Hardware / calibration ---
@@ -1060,6 +1180,7 @@ class ScanWidget(QWidget):
             self._connect_btn.setText("Connect")
             self._conn_status.setText("Disconnected")
             self._conn_status.setStyleSheet("color: gray;")
+            self._pos_label.setText("Position: — mm")
             self._log("ESP32 disconnected.")
             return
         try:
@@ -1077,10 +1198,45 @@ class ScanWidget(QWidget):
             self._connect_btn.setText("Disconnect")
             self._conn_status.setText(f"Connected ({port})")
             self._conn_status.setStyleSheet("color: green; font-weight: bold;")
+            # Restore last known position
+            last_pos = _load_esp_position()
+            if last_pos != 0.0:
+                self._ctrl.set_position(last_pos)
+                self._log(f"Restored position: {last_pos:.4f} mm")
+            self._pos_label.setText(f"Position: {last_pos:.4f} mm")
             self._log(f"Connected to ESP32 on {port}")
         except Exception as exc:
             self._log(f"Connection error: {exc}")
             self._ctrl = None
+
+    def _on_zero(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first."); return
+        self._ctrl.zero()
+        self._pos_label.setText("Position: 0.0000 mm")
+        _save_esp_position(0.0)
+        self._log("Zeroed position.")
+
+    def _on_go_home(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first."); return
+        self._ctrl.go_home()
+        self._pos_label.setText("Position: 0.0000 mm (homing…)")
+        _save_esp_position(0.0)
+        self._log("Going home (moving to 0).")
+
+    def _on_move_to(self):
+        if self._ctrl is None:
+            self._log("ERROR: Connect to ESP32 first."); return
+        target = self._move_to_spin.value()
+        cur = _load_esp_position()
+        delta = target - cur
+        if abs(delta) < 1e-6:
+            self._log("Already at target position."); return
+        self._ctrl.move(delta)
+        self._pos_label.setText(f"Position: {target:.4f} mm (moving…)")
+        _save_esp_position(target)
+        self._log(f"Moving to {target:.4f} mm (delta={delta:+.4f} mm).")
 
     # ------------------------------------------------------------------ build steps
     def _build_range(self, lo_spin, hi_spin, step_spin) -> list[float]:
