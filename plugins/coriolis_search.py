@@ -113,6 +113,14 @@ LATITUDE_DEG = 41.3        # degrees — Yale University, New Haven CT
 KAPPA = 2 * OMEGA_EARTH * math.sin(math.radians(LATITUDE_DEG))  # ≈ 9.61e-5 rad/s
 G_ACCEL = 9.80665          # m/s²  — standard gravitational acceleration
 
+# Cardinal-direction unit vectors (East-North-Up)
+_DIR_VECTORS = {
+    "+East":  ( 1,  0),
+    "–East":  (-1,  0),
+    "+North": ( 0,  1),
+    "–North": ( 0, -1),
+}
+
 _WAVE_FIRMWARE = {"Sine": "SINE", "Triangle": "TRAP", "Rounded Triangle": "SCURVE"}
 
 
@@ -358,37 +366,51 @@ def matched_filter_snr(
     return A_hat, sigma_A, snr
 
 
+def coriolis_sign(drive_dir: str, accel_dir: str) -> float:
+    """Return the sign (+1 or -1) for  a_meas = sign * κ * |ẋ|.
+
+    The horizontal Coriolis acceleration for velocity v_drive is:
+        a_Cor = -2Ω×v  (projected horizontally, Northern hemisphere).
+    For a drive along (dx, dy) the Coriolis deflection is along (-dy, dx)
+    scaled by 2Ω sinλ.  The measured component is the projection of that
+    onto the accelerometer axis.
+    """
+    dx, dy = _DIR_VECTORS.get(drive_dir, (1, 0))
+    ax, ay = _DIR_VECTORS.get(accel_dir, (0, 1))
+    # Coriolis deflection direction when drive velocity > 0: (-dy, dx)
+    proj = (-dy) * ax + dx * ay
+    if proj == 0:
+        return -1.0  # fallback
+    return float(proj)  # +1 or -1
+
+
 def coriolis_template(
     enc_mean_mm: NDArray, phase: NDArray, cycle_period_s: float,
+    sign: float = -1.0,
 ) -> tuple[NDArray, NDArray]:
     """Predicted Coriolis acceleration from the phase-folded encoder.
 
-    Coordinates: +x = east, +y = north, +z = up (right-handed ENU).
-    The table oscillates along x; the accelerometer measures y.
-
-    In the Northern hemisphere the Coriolis acceleration in y is:
-
-        a_y(t) = −κ · ẋ_table(t)
-
-    where κ = 2 Ω_⊕ sin λ ≈ 9.61 × 10⁻⁵ rad/s at Yale.
-    Moving east (ẋ > 0) deflects south (a_y < 0).
+    The table oscillates along the drive axis; the accelerometer
+    measures the perpendicular axis.  *sign* encodes the coordinate
+    convention (see `coriolis_sign`).
 
     Parameters
     ----------
-    enc_mean_mm    : Phase-folded encoder position x [mm].
+    enc_mean_mm    : Phase-folded encoder position [mm].
     phase          : Phase grid (0 to 1, N_PHASE_BINS points).
     cycle_period_s : Mean oscillation period [s].
+    sign           : +1 or -1, from `coriolis_sign()`.
 
     Returns
     -------
-    a_cor_g : Predicted Coriolis acceleration along y [g].
-    v_mms   : Table velocity ẋ [mm/s].
+    a_cor_g : Predicted Coriolis acceleration along accel axis [g].
+    v_mms   : Table velocity [mm/s].
     """
     dphi = phase[1] - phase[0] if len(phase) > 1 else 1.0
     dt = dphi * cycle_period_s                        # seconds per phase bin
     v_mms = np.gradient(enc_mean_mm, dt)              # mm/s
     v_ms  = v_mms * 1e-3                              # m/s
-    a_cor_ms2 = -KAPPA * v_ms                         # m/s²  (negative sign)
+    a_cor_ms2 = sign * KAPPA * v_ms                    # m/s²
     a_cor_g   = a_cor_ms2 / G_ACCEL                   # g
     return a_cor_g, v_mms
 
@@ -604,7 +626,31 @@ class ContinuousWidget(QWidget):
             "Half-width (degrees) of the search region centred on\n"
             "0° and 180° (the velocity peaks).")
         r3.addWidget(self._search_hw_spin)
-        hw_lay.addLayout(r3)
+
+        r4 = QHBoxLayout()
+        r4.addWidget(QLabel("Drive axis:"))
+        self._drive_dir = QComboBox()
+        self._drive_dir.addItems(list(_DIR_VECTORS.keys()))
+        self._drive_dir.setCurrentText("+East")
+        self._drive_dir.setMaximumWidth(90)
+        self._drive_dir.setToolTip(
+            "Compass direction of positive encoder displacement.")
+        r4.addWidget(self._drive_dir)
+        r4.addWidget(QLabel("Accel axis:"))
+        self._accel_dir = QComboBox()
+        self._accel_dir.addItems(list(_DIR_VECTORS.keys()))
+        self._accel_dir.setCurrentText("+North")
+        self._accel_dir.setMaximumWidth(90)
+        self._accel_dir.setToolTip(
+            "Compass direction of positive accelerometer reading.")
+        r4.addWidget(self._accel_dir)
+        self._sign_lbl = QLabel("")
+        self._sign_lbl.setStyleSheet("color: #6d28d9; font-size: 10px;")
+        r4.addWidget(self._sign_lbl)
+        r4.addStretch()
+        self._drive_dir.currentTextChanged.connect(self._update_sign_label)
+        self._accel_dir.currentTextChanged.connect(self._update_sign_label)
+        hw_lay.addLayout(r4)
 
         top.addWidget(hw_grp)
 
@@ -646,10 +692,22 @@ class ContinuousWidget(QWidget):
 
         # Initial computed-readout
         self._on_wave_or_param_changed()
+        self._update_sign_label()
 
     # helpers
     def _log(self, msg: str):
         self._log_box.append(msg)
+
+    def _get_sign(self) -> float:
+        return coriolis_sign(
+            self._drive_dir.currentText(),
+            self._accel_dir.currentText())
+
+    def _update_sign_label(self, _=None):
+        s = self._get_sign()
+        txt = "+" if s > 0 else "–"
+        self._sign_lbl.setText(
+            f"a_cor = {txt}κ·v   (sign = {s:+.0f})")
 
     # ---- ESP32 connection ----
     def _toggle_connect(self):
@@ -926,7 +984,8 @@ class ContinuousWidget(QWidget):
         T_s = self._mean_period_s if self._mean_period_s > 0 else 1.0
 
         # Physical Coriolis prediction from encoder velocity
-        a_cor_g, v_mms = coriolis_template(enc_mean, phase, T_s)
+        a_cor_g, v_mms = coriolis_template(enc_mean, phase, T_s,
+                                            sign=self._get_sign())
 
         accel_ug = accel_mean * 1e6       # g → µg
         sem_ug   = accel_sem * 1e6
@@ -1810,8 +1869,9 @@ class ScanWidget(QWidget):
                                   alpha=0.3, color="C0", label="±1 SEM")
                 # Overlay calibrated Coriolis prediction from encoder
                 if enc_acc is not None and enc_acc.count >= 2:
+                    sign = self._plugin._cont_widget._get_sign()
                     a_cor_g, v_mms = coriolis_template(
-                        enc_acc.mean, phase, T_s)
+                        enc_acc.mean, phase, T_s, sign=sign)
                     a_cor_ug = a_cor_g * 1e6
                     cor_peak_ug = float(np.max(np.abs(a_cor_ug)))
                     ax_t.plot(phase_deg, a_cor_ug, "g-", lw=1.2,
