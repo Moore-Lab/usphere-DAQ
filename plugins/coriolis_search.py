@@ -854,7 +854,6 @@ class ContinuousWidget(QWidget):
         self._mean_period_s = 0.0
         self._period_count = 0
         self._cycle_lbl.setText("Cycles: 0")
-        self._clear_plots()
         self._log("Template reset.")
 
     def _hwf(self, widget, default: float) -> float:
