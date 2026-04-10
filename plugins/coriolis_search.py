@@ -31,6 +31,7 @@ from numpy.typing import NDArray
 from scipy.signal import butter, filtfilt
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -39,6 +40,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QTabWidget,
@@ -112,6 +114,22 @@ KAPPA = 2 * OMEGA_EARTH * math.sin(math.radians(LATITUDE_DEG))  # ≈ 9.61e-5 ra
 G_ACCEL = 9.80665          # m/s²  — standard gravitational acceleration
 
 _WAVE_FIRMWARE = {"Sine": "SINE", "Triangle": "TRAP", "Rounded Triangle": "SCURVE"}
+
+
+def _tri_speed_from_freq(wave: str, amp: float, freq: float, duty: float) -> float:
+    """Constant-velocity segment speed (mm/s) for a triangle-family waveform."""
+    if wave == "Rounded Triangle":
+        return 12.0 * amp * freq / (2.0 + duty)
+    return 8.0 * amp * freq / (1.0 + duty)
+
+
+def _tri_freq_from_speed(wave: str, amp: float, speed: float, duty: float) -> float:
+    """Oscillation frequency (Hz) for a triangle-family waveform given speed."""
+    if amp <= 0:
+        return 0.0
+    if wave == "Rounded Triangle":
+        return speed * (2.0 + duty) / (12.0 * amp)
+    return speed * (1.0 + duty) / (8.0 * amp)
 
 
 def _apply_waveform_params(ctrl, wave_name: str, amp: float, freq: float, duty: float):
@@ -396,26 +414,54 @@ class ContinuousWidget(QWidget):
         m1.addWidget(QLabel("Waveform:"))
         self._wave_combo = QComboBox()
         self._wave_combo.addItems(["Sine", "Triangle", "Rounded Triangle"])
+        self._wave_combo.currentTextChanged.connect(self._on_wave_or_param_changed)
         m1.addWidget(self._wave_combo)
         m1.addWidget(QLabel("Amplitude (mm):"))
         self._amp_spin = QDoubleSpinBox()
         self._amp_spin.setRange(0.001, 10.0); self._amp_spin.setValue(0.5)
         self._amp_spin.setDecimals(3); self._amp_spin.setSingleStep(0.1)
         self._amp_spin.setMaximumWidth(80)
+        self._amp_spin.valueChanged.connect(self._on_wave_or_param_changed)
         m1.addWidget(self._amp_spin)
-        m1.addWidget(QLabel("Frequency (Hz):"))
+
+        # Drive-mode radio buttons (Frequency vs Speed)
+        self._freq_radio = QRadioButton("Frequency (Hz):")
+        self._freq_radio.setChecked(True)
+        self._speed_radio = QRadioButton("Speed (mm/s):")
+        self._drive_mode_group = QButtonGroup(self)
+        self._drive_mode_group.addButton(self._freq_radio)
+        self._drive_mode_group.addButton(self._speed_radio)
+        self._drive_mode_group.buttonToggled.connect(self._on_drive_mode_changed)
+        m1.addWidget(self._freq_radio)
         self._freq_spin = QDoubleSpinBox()
         self._freq_spin.setRange(0.01, 100.0); self._freq_spin.setValue(1.0)
         self._freq_spin.setDecimals(3); self._freq_spin.setSingleStep(0.1)
         self._freq_spin.setMaximumWidth(80)
+        self._freq_spin.valueChanged.connect(self._on_wave_or_param_changed)
         m1.addWidget(self._freq_spin)
+        m1.addWidget(self._speed_radio)
+        self._speed_spin = QDoubleSpinBox()
+        self._speed_spin.setRange(0.001, 500.0); self._speed_spin.setValue(1.0)
+        self._speed_spin.setDecimals(3); self._speed_spin.setSingleStep(0.5)
+        self._speed_spin.setMaximumWidth(80)
+        self._speed_spin.setEnabled(False)
+        self._speed_spin.valueChanged.connect(self._on_wave_or_param_changed)
+        m1.addWidget(self._speed_spin)
+
         m1.addWidget(QLabel("Duty cycle:"))
         self._duty_spin = QDoubleSpinBox()
         self._duty_spin.setRange(0.1, 0.99); self._duty_spin.setValue(0.90)
         self._duty_spin.setDecimals(2); self._duty_spin.setSingleStep(0.01)
         self._duty_spin.setMaximumWidth(70)
+        self._duty_spin.valueChanged.connect(self._on_wave_or_param_changed)
         m1.addWidget(self._duty_spin)
         motor_lay.addLayout(m1)
+
+        # Computed readout line
+        self._computed_lbl = QLabel("")
+        self._computed_lbl.setStyleSheet(
+            "color: #2563eb; font-size: 10px; padding-left: 4px;")
+        motor_lay.addWidget(self._computed_lbl)
 
         m2 = QHBoxLayout()
         self._apply_start_btn = QPushButton("Apply && Start Motor")
@@ -539,6 +585,9 @@ class ContinuousWidget(QWidget):
         self._log_box.setMaximumHeight(100)
         top.addWidget(self._log_box)
 
+        # Initial computed-readout
+        self._on_wave_or_param_changed()
+
     # helpers
     def _log(self, msg: str):
         self._log_box.append(msg)
@@ -619,6 +668,55 @@ class ContinuousWidget(QWidget):
         _save_esp_position(target)
         self._log(f"Moving to {target:.4f} mm (delta={delta:+.4f} mm).")
 
+    # ---- Drive mode (frequency vs speed) ----
+    def _on_drive_mode_changed(self):
+        freq_mode = self._freq_radio.isChecked()
+        self._freq_spin.setEnabled(freq_mode)
+        self._speed_spin.setEnabled(not freq_mode)
+        self._on_wave_or_param_changed()
+
+    def _on_wave_or_param_changed(self, _=None):
+        wave = self._wave_combo.currentText()
+        amp = self._amp_spin.value()
+        duty = self._duty_spin.value()
+        freq_mode = self._freq_radio.isChecked()
+        is_triangle = wave in ("Triangle", "Rounded Triangle")
+
+        if not is_triangle:
+            self._speed_spin.setEnabled(False)
+            self._speed_radio.setEnabled(False)
+            self._freq_spin.setEnabled(True)
+            if wave == "Sine":
+                v_peak = 2.0 * math.pi * self._freq_spin.value() * amp
+                self._computed_lbl.setText(
+                    f"Sine peak velocity = {v_peak:.3f} mm/s")
+            else:
+                self._computed_lbl.setText("")
+            return
+
+        self._speed_radio.setEnabled(True)
+        if freq_mode:
+            freq = self._freq_spin.value()
+            speed = _tri_speed_from_freq(wave, amp, freq, duty)
+            self._computed_lbl.setText(
+                f"↳ Constant-velocity speed = {speed:.3f} mm/s")
+        else:
+            speed = self._speed_spin.value()
+            freq = _tri_freq_from_speed(wave, amp, speed, duty)
+            self._computed_lbl.setText(
+                f"↳ Oscillation frequency = {freq:.4f} Hz  "
+                f"(period = {1.0/freq:.3f} s)" if freq > 0 else "")
+
+    def _get_effective_freq(self) -> float:
+        """Return the oscillation frequency, computing from speed if needed."""
+        wave = self._wave_combo.currentText()
+        if self._freq_radio.isChecked() or wave not in ("Triangle", "Rounded Triangle"):
+            return self._freq_spin.value()
+        amp = self._amp_spin.value()
+        duty = self._duty_spin.value()
+        speed = self._speed_spin.value()
+        return _tri_freq_from_speed(wave, amp, speed, duty)
+
     # ---- Motor control ----
     def _apply_and_start_motor(self):
         if self._ctrl is None:
@@ -626,7 +724,7 @@ class ContinuousWidget(QWidget):
             return
         wave = self._wave_combo.currentText()
         amp = self._amp_spin.value()
-        freq = self._freq_spin.value()
+        freq = self._get_effective_freq()
         duty = self._duty_spin.value()
         try:
             self._ctrl.enable()
