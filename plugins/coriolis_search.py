@@ -1149,24 +1149,35 @@ class PlotWidget(QWidget):
         ax3.fill_between(phase_deg,
                          residual_ug - sem_ug, residual_ug + sem_ug,
                          alpha=0.3, color="C0", label="±1 SEM")
-        ax3.plot(phase_deg, a_cor_ug, "g-", lw=1.2, alpha=0.85,
-                 label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
-        ax3.set_ylabel("y res\n(µg)", fontsize=9)
-        ax3.set_xlabel("Phase (degrees)")
-        ax3.grid(True, alpha=0.3)
-        mark_coriolis_region(ax3, phase_deg, search_hw)
         if use_mf:
+            # Scale template to matched-filter best-fit amplitude
+            t = a_cor_ug.copy()
+            t_norm = np.max(np.abs(t))
+            if t_norm > 0:
+                mf_fit_ug = t * (mf_A_ug / t_norm)
+            else:
+                mf_fit_ug = t
+            ax3.plot(phase_deg, mf_fit_ug, "m-", lw=1.4, alpha=0.9,
+                     label=f"MF best fit ({mf_A_ug:.4f} ± {mf_sigma_ug:.4f} µg)")
+            ax3.plot(phase_deg, a_cor_ug, "g--", lw=0.8, alpha=0.45,
+                     label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
             ax3.set_title(
                 f"v_peak = {v_peak:.2f} mm/s — "
                 f"MF amplitude = {mf_A_ug:.4f} ± {mf_sigma_ug:.4f} µg — "
                 f"SNR_MF = {snr_mf:.1f}",
                 fontsize=9, color="darkblue")
         else:
+            ax3.plot(phase_deg, a_cor_ug, "g-", lw=1.2, alpha=0.85,
+                     label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
+            mark_coriolis_region(ax3, phase_deg, search_hw)
             ax3.set_title(
                 f"v_peak = {v_peak:.2f} mm/s — "
                 f"Coriolis peak = {cor_peak_ug:.4f} µg — "
                 f"SEM = {sem_avg*1e6:.2e} µg — SNR = {snr_region:.1f}",
                 fontsize=9, color="darkblue")
+        ax3.set_ylabel("y res\n(µg)", fontsize=9)
+        ax3.set_xlabel("Phase (degrees)")
+        ax3.grid(True, alpha=0.3)
         ax3.legend(loc="upper right", fontsize=8)
 
         # Apply log/linear
