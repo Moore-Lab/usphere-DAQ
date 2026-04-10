@@ -266,14 +266,28 @@ class TemplateAccumulator:
 def get_coriolis_phase_ranges(
     waveform: str, duty: float = 0.9,
 ) -> list[tuple[float, float]]:
+    """Phase ranges (degrees) where table velocity is large.
+
+    Phase is defined by rising zero crossings of the encoder position:
+        0° / 360° = position zero crossing (velocity = +v_max)
+        90°       = position peak (+A, velocity = 0, turning point)
+        180°      = position zero crossing (velocity = -v_max)
+        270°      = position trough (-A, velocity = 0, turning point)
+
+    The Coriolis acceleration is proportional to velocity, so the
+    Coriolis-active regions are the constant-velocity segments
+    centered on 0° and 180°, NOT the turning points at 90° and 270°.
+    """
     if waveform == "Sine":
-        return [(60.0, 120.0), (240.0, 300.0)]
+        # |cos(θ)| > 0.5  →  θ ∈ [0,60] ∪ [120,240] ∪ [300,360]
+        return [(0.0, 60.0), (120.0, 240.0), (300.0, 360.0)]
     else:
-        corner_frac = (1.0 - duty) / 2.0
-        corner_deg = corner_frac * 180.0
+        # Corners centered at 90° and 270°; half-width = (1-duty)/2 × 180°
+        corner_half = (1.0 - duty) / 2.0 * 180.0
         return [
-            (corner_deg, 180.0 - corner_deg),
-            (180.0 + corner_deg, 360.0 - corner_deg),
+            (0.0, 90.0 - corner_half),
+            (90.0 + corner_half, 270.0 - corner_half),
+            (270.0 + corner_half, 360.0),
         ]
 
 
@@ -281,8 +295,8 @@ def mark_coriolis_region(ax, waveform: str, phase_deg: NDArray, duty: float = 0.
     regions = get_coriolis_phase_ranges(waveform, duty)
     for lo, hi in regions:
         ax.axvspan(lo, hi, alpha=0.10, color="green", zorder=0)
-    if regions:
-        mid = (regions[0][0] + regions[0][1]) / 2.0
+    if regions and len(regions) > 1:
+        mid = (regions[1][0] + regions[1][1]) / 2.0
         ax.annotate(
             "Coriolis region", xy=(mid, 0),
             xycoords=("data", "axes fraction"),
