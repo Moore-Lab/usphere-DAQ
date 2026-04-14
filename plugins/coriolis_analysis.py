@@ -1,7 +1,7 @@
 """
 Plugin: Coriolis Force Noise Analysis
 
-Online wrapper for Microsphere-Utility-Scripts/coriolis_analysis.py.
+Online wrapper for Microsphere-Utility-Scripts calibration tools (getX).
 Provides embedded susceptibility and force-noise plots with live updating.
 
 Configuration mirrors the top-of-file constants in the offline script.

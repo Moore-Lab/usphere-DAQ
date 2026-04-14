@@ -1633,21 +1633,35 @@ class ScanWidget(QWidget):
         amp_row.addStretch()
         sl.addLayout(amp_row)
 
-        # Frequency range
+        # Frequency / speed range (with radio toggle)
+        fs_radio_row = QHBoxLayout()
+        self._scan_freq_radio = QRadioButton("Frequency (Hz)")
+        self._scan_speed_radio = QRadioButton("Speed (mm/s)")
+        self._scan_freq_radio.setChecked(True)
+        scan_fs_group = QButtonGroup(self)
+        scan_fs_group.addButton(self._scan_freq_radio, 0)
+        scan_fs_group.addButton(self._scan_speed_radio, 1)
+        self._scan_freq_radio.toggled.connect(self._on_scan_fs_toggled)
+        fs_radio_row.addWidget(self._scan_freq_radio)
+        fs_radio_row.addWidget(self._scan_speed_radio)
+        fs_radio_row.addStretch()
+        sl.addLayout(fs_radio_row)
+
         freq_row = QHBoxLayout()
-        freq_row.addWidget(QLabel("Frequency (Hz):"))
+        self._freq_label = QLabel("Frequency (Hz):")
+        freq_row.addWidget(self._freq_label)
         self._freq_lo = QDoubleSpinBox()
-        self._freq_lo.setRange(0.01, 100.0); self._freq_lo.setValue(0.5)
+        self._freq_lo.setRange(0.001, 500.0); self._freq_lo.setValue(0.5)
         self._freq_lo.setDecimals(3); self._freq_lo.setSingleStep(0.1)
         freq_row.addWidget(self._freq_lo)
         freq_row.addWidget(QLabel("to"))
         self._freq_hi = QDoubleSpinBox()
-        self._freq_hi.setRange(0.01, 100.0); self._freq_hi.setValue(2.0)
+        self._freq_hi.setRange(0.001, 500.0); self._freq_hi.setValue(2.0)
         self._freq_hi.setDecimals(3); self._freq_hi.setSingleStep(0.5)
         freq_row.addWidget(self._freq_hi)
         freq_row.addWidget(QLabel("Step:"))
         self._freq_step = QDoubleSpinBox()
-        self._freq_step.setRange(0.001, 50.0); self._freq_step.setValue(0.5)
+        self._freq_step.setRange(0.001, 250.0); self._freq_step.setValue(0.5)
         self._freq_step.setDecimals(3); self._freq_step.setSingleStep(0.1)
         freq_row.addWidget(self._freq_step)
         freq_row.addStretch()
@@ -1682,14 +1696,10 @@ class ScanWidget(QWidget):
         self._log_box.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
         root.addWidget(self._log_box)
 
-        # --- Plot area (scrollable) ---
-        self._plot_layout = QVBoxLayout()
-        plot_widget = QWidget()
-        plot_widget.setLayout(self._plot_layout)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(plot_widget)
-        root.addWidget(scroll, stretch=1)
+    # ------------------------------------------------------------------ freq/speed toggle
+    def _on_scan_fs_toggled(self, checked: bool):
+        use_freq = self._scan_freq_radio.isChecked()
+        self._freq_label.setText("Frequency (Hz):" if use_freq else "Speed (mm/s):")
 
     # ------------------------------------------------------------------ helpers
     def _log(self, msg: str):
@@ -1801,12 +1811,17 @@ class ScanWidget(QWidget):
         if self._cb_scurve.isChecked():
             waves.append(("Rounded Triangle", "SCURVE"))
         amps = self._build_range(self._amp_lo, self._amp_hi, self._amp_step)
-        freqs = self._build_range(self._freq_lo, self._freq_hi, self._freq_step)
+        raw_vals = self._build_range(self._freq_lo, self._freq_hi, self._freq_step)
         duty = self._duty_spin.value()
+        use_speed = self._scan_speed_radio.isChecked()
         steps = []
         for wname, wfw in waves:
             for amp in amps:
-                for freq in freqs:
+                for rv in raw_vals:
+                    if use_speed and wname != "Sine":
+                        freq = _tri_freq_from_speed(wname, amp, rv, duty)
+                    else:
+                        freq = rv
                     steps.append((wname, wfw, amp, freq, duty))
         return steps
 
@@ -1932,52 +1947,76 @@ class ScanWidget(QWidget):
         self._update_summary_plot()
 
     # ------------------------------------------------------------------ plotting
-    def _clear_plots(self):
-        while self._plot_layout.count():
-            item = self._plot_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
     def _update_summary_plot(self):
-        self._clear_plots()
         if not self._point_accs:
             return
+        self._plugin._scan_plot_widget.update_scan(
+            point_accs=self._point_accs,
+            point_enc_accs=self._point_enc_accs,
+            point_cycles=self._point_cycles,
+            point_periods=self._point_periods,
+            active_key=self._active_key,
+            n_bins=self._n_bins,
+            search_hw=self._search_hw_spin.value(),
+            sign=self._plugin._cont_widget._get_sign(),
+        )
 
-        phase = np.linspace(0.0, 1.0, self._n_bins, endpoint=False)
+
+# ===================================================================
+#  SCAN PLOT WIDGET
+# ===================================================================
+
+class ScanPlotWidget(QWidget):
+    """Dedicated tab for scan-mode heatmaps + active template plot."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        self._fig = Figure(tight_layout=True)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._toolbar = NavigationToolbar2QT(self._canvas, self)
+        lay.addWidget(self._toolbar)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._canvas)
+        lay.addWidget(scroll, stretch=1)
+
+    def update_scan(self, *, point_accs, point_enc_accs, point_cycles,
+                    point_periods, active_key, n_bins, search_hw, sign):
+        self._fig.clear()
+
+        phase = np.linspace(0.0, 1.0, n_bins, endpoint=False)
 
         # Collect SNR for every completed point
         snr_data: list[tuple[str, float, float, float, int]] = []
-        for (wf, amp, freq), acc in self._point_accs.items():
+        for (wf, amp, freq), acc in point_accs.items():
             if acc.count < 2:
                 continue
             _, _, snr = compute_snr(
-                acc.mean, acc.sem, phase,
-                self._search_hw_spin.value(),
-            )
-            n_cyc = self._point_cycles.get((wf, amp, freq), 0)
+                acc.mean, acc.sem, phase, search_hw)
+            n_cyc = point_cycles.get((wf, amp, freq), 0)
             snr_data.append((wf, amp, freq, snr, n_cyc))
 
         if not snr_data:
+            self._canvas.draw_idle()
             return
 
-        # Group by waveform
-        waveforms = sorted(set(d[0] for d in snr_data),
-                          key=lambda w: ["Sine", "Triangle", "Rounded Triangle"].index(w)
-                          if w in ["Sine", "Triangle", "Rounded Triangle"] else 99)
+        waveforms = sorted(
+            set(d[0] for d in snr_data),
+            key=lambda w: ["Sine", "Triangle", "Rounded Triangle"].index(w)
+            if w in ["Sine", "Triangle", "Rounded Triangle"] else 99)
         amps_all = sorted(set(d[1] for d in snr_data))
         freqs_all = sorted(set(d[2] for d in snr_data))
 
         n_waves = len(waveforms)
-        # One row of heatmaps + one row for active template = n_waves + 1 panels
-        fig = Figure(figsize=(max(8, 4 * len(freqs_all)), 4 * (n_waves + 1)),
-                     tight_layout=True)
+        n_panels = n_waves + 1  # heatmaps + active template
 
-        # --- Heatmaps: one per waveform ---
+        # --- Heatmaps ---
         for wi, wf in enumerate(waveforms):
-            ax = fig.add_subplot(n_waves + 1, 1, wi + 1)
-            # Build 2D grid (amp × freq)
-            wf_data = {(d[1], d[2]): (d[3], d[4]) for d in snr_data if d[0] == wf}
+            ax = self._fig.add_subplot(n_panels, 1, wi + 1)
+            wf_data = {(d[1], d[2]): (d[3], d[4])
+                       for d in snr_data if d[0] == wf}
             grid = np.full((len(amps_all), len(freqs_all)), np.nan)
             annot = [['' for _ in freqs_all] for _ in amps_all]
             for ai, a in enumerate(amps_all):
@@ -1986,7 +2025,6 @@ class ScanWidget(QWidget):
                         snr_val, n_cyc = wf_data[(a, f)]
                         grid[ai, fi] = snr_val
                         annot[ai][fi] = f"{snr_val:.1f}\n({n_cyc})"
-
             im = ax.imshow(grid, aspect="auto", origin="lower",
                            cmap="RdYlGn", interpolation="nearest")
             ax.set_xticks(range(len(freqs_all)))
@@ -1995,58 +2033,54 @@ class ScanWidget(QWidget):
             ax.set_yticklabels([f"{a:.3f}" for a in amps_all], fontsize=8)
             ax.set_xlabel("Frequency (Hz)", fontsize=9)
             ax.set_ylabel("Amplitude (mm)", fontsize=9)
-            ax.set_title(f"{wf} — SNR (cycles)", fontsize=10)
-
-            # Annotate cells
+            ax.set_title(f"{wf} \u2014 SNR (cycles)", fontsize=10)
             for ai in range(len(amps_all)):
                 for fi in range(len(freqs_all)):
                     if annot[ai][fi]:
-                        ax.text(fi, ai, annot[ai][fi], ha="center", va="center",
-                                fontsize=7, color="black")
-            fig.colorbar(im, ax=ax, label="SNR", shrink=0.8)
+                        ax.text(fi, ai, annot[ai][fi], ha="center",
+                                va="center", fontsize=7, color="black")
+            self._fig.colorbar(im, ax=ax, label="SNR", shrink=0.8)
 
         # --- Active template panel ---
-        if self._active_key and self._active_key in self._point_accs:
-            acc = self._point_accs[self._active_key]
-            enc_acc = self._point_enc_accs.get(self._active_key)
-            mean_p, _ = self._point_periods.get(self._active_key, (1.0, 0))
+        if active_key and active_key in point_accs:
+            acc = point_accs[active_key]
+            enc_acc = point_enc_accs.get(active_key)
+            mean_p, _ = point_periods.get(active_key, (1.0, 0))
             T_s = mean_p if mean_p > 0 else 1.0
             if acc.count >= 2:
-                ax_t = fig.add_subplot(n_waves + 1, 1, n_waves + 1)
+                ax_t = self._fig.add_subplot(n_panels, 1, n_panels)
                 phase_deg = phase * 360.0
-                residual_ug = (acc.mean - np.mean(acc.mean)) * 1e6  # g → µg
+                residual_ug = (acc.mean - np.mean(acc.mean)) * 1e6
                 sem_ug = acc.sem * 1e6
                 ax_t.plot(phase_deg, residual_ug, "k-", lw=1.0,
-                          label="Residual y (µg)")
+                          label="Residual y (\u00b5g)")
                 ax_t.fill_between(phase_deg,
-                                  residual_ug - sem_ug, residual_ug + sem_ug,
-                                  alpha=0.3, color="C0", label="±1 SEM")
-                # Overlay calibrated Coriolis prediction from encoder
+                                  residual_ug - sem_ug,
+                                  residual_ug + sem_ug,
+                                  alpha=0.3, color="C0", label="\u00b11 SEM")
                 if enc_acc is not None and enc_acc.count >= 2:
-                    sign = self._plugin._cont_widget._get_sign()
                     a_cor_g, v_mms = coriolis_template(
                         enc_acc.mean, phase, T_s, sign=sign)
                     a_cor_ug = a_cor_g * 1e6
-                    cor_peak_ug = float(np.max(np.abs(a_cor_ug)))
-                    ax_t.plot(phase_deg, a_cor_ug, "g-", lw=1.2,
-                              alpha=0.85,
-                              label=f"Predicted Coriolis ({cor_peak_ug:.4f} µg)")
-                mark_coriolis_region(ax_t, phase_deg,
-                                    self._search_hw_spin.value())
-                wf, a, f = self._active_key
-                n_cyc = self._point_cycles.get(self._active_key, 0)
+                    cor_peak = float(np.max(np.abs(a_cor_ug)))
+                    ax_t.plot(phase_deg, a_cor_ug, "g-", lw=1.2, alpha=0.85,
+                              label=f"Predicted Coriolis ({cor_peak:.4f} \u00b5g)")
+                mark_coriolis_region(ax_t, phase_deg, search_hw)
+                wf, a, f = active_key
+                n_cyc = point_cycles.get(active_key, 0)
                 ax_t.set_title(
                     f"Active: {wf} A={a:.3f} mm f={f:.3f} Hz  "
-                    f"({n_cyc} cycles) — T = {T_s:.3f} s", fontsize=10)
+                    f"({n_cyc} cycles) \u2014 T = {T_s:.3f} s", fontsize=10)
                 ax_t.set_xlabel("Phase (degrees)")
-                ax_t.set_ylabel("Residual accel y (µg)")
-                ax_t.set_xlim(0, 360); ax_t.grid(True, alpha=0.3)
+                ax_t.set_ylabel("y res\n(\u00b5g)", fontsize=9)
+                ax_t.set_xlim(0, 360)
+                ax_t.grid(True, alpha=0.3)
                 ax_t.legend(loc="upper right", fontsize=8)
 
-        canvas = FigureCanvasQTAgg(fig)
-        toolbar = NavigationToolbar2QT(canvas, self)
-        self._plot_layout.addWidget(toolbar)
-        self._plot_layout.addWidget(canvas)
+        self._fig.set_size_inches(
+            max(8, 4 * max(len(freqs_all), 1)),
+            4 * n_panels)
+        self._canvas.draw_idle()
 
 
 # ===================================================================
@@ -2066,9 +2100,11 @@ class Plugin(AnalysisPlugin):
         self._cont_widget = ContinuousWidget(self)
         self._scan_widget = ScanWidget(self)
         self._plot_widget = PlotWidget()
+        self._scan_plot_widget = ScanPlotWidget()
         self._tabs.addTab(self._cont_widget, "Continuous")
         self._tabs.addTab(self._scan_widget, "Scan")
         self._tabs.addTab(self._plot_widget, "Plot")
+        self._tabs.addTab(self._scan_plot_widget, "Scan Plot")
         return self._tabs
 
     def on_file_written(self, filepath: str):

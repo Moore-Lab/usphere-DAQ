@@ -1,7 +1,7 @@
 """
 Plugin: Coriolis Alignment Diagnostics
 
-Online wrapper for Microsphere-Utility-Scripts/coriolis_alignment.py.
+Online wrapper for analysis/Inertial-Sensing/table_modulation/experiment/coriolis_alignment.py.
 Provides embedded accelerometer & encoder diagnostic plots with live updating.
 
 Plot flags mirror the offline script:
@@ -49,12 +49,14 @@ from matplotlib.figure import Figure
 from plugins.base import AnalysisPlugin
 
 # Resolve the external script explicitly to avoid name collision with this file.
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "Microsphere-Utility-Scripts"
-_CA_MODULE_PATH = _SCRIPTS_DIR / "coriolis_alignment.py"
+_INERTIAL_DIR = Path(__file__).resolve().parent.parent / "analysis" / "Inertial-Sensing"
+_CA_MODULE_PATH = _INERTIAL_DIR / "table_modulation" / "experiment" / "coriolis_alignment.py"
+# Microsphere-Utility-Scripts is still needed on sys.path for transitive imports
+_SCRIPTS_DIR = _INERTIAL_DIR / "microsphere_utility_scripts"
 
 
 def _get_ca_module():
-    """Import Microsphere-Utility-Scripts/coriolis_alignment.py by file path."""
+    """Import coriolis_alignment.py from the Inertial-Sensing experiment directory."""
     import importlib.util
     # Add scripts dir to sys.path so coriolis_alignment's own imports work
     if str(_SCRIPTS_DIR) not in sys.path:
