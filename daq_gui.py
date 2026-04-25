@@ -390,13 +390,20 @@ _DEFAULT_VRANGE_INDEX = 6
 # Main window
 # ---------------------------------------------------------------------------
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("usphere DAQ Control")
-        self.resize(960, 720)
+class DAQWidget(QWidget):
+    """
+    Embeddable DAQ control panel.
 
-        self._recorder: DAQRecorder | None = None
+    Pass *recorder* and/or *server* to share state with an already-running
+    DAQServer instance (e.g. when embedded in the unified GUI).  When omitted
+    a fresh DAQRecorder is created for standalone use.
+    """
+
+    def __init__(self, recorder: DAQRecorder | None = None, server=None):
+        super().__init__()
+
+        self._recorder: DAQRecorder | None = recorder
+        self._server = server       # DAQServer reference for inject access
         self._signals = _RecorderSignals()
         self._signals.status_message.connect(self._append_status)
         self._signals.file_written.connect(self._on_file_written)
@@ -411,9 +418,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
-        vbox = QVBoxLayout(root)
+        vbox = QVBoxLayout(self)
         vbox.setSpacing(4)
         vbox.setContentsMargins(6, 6, 6, 6)
 
@@ -815,9 +820,21 @@ class MainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class DAQWindow(QMainWindow):
+    """Standalone window wrapper for DAQWidget."""
+
+    def __init__(self, recorder: DAQRecorder | None = None, server=None):
+        super().__init__()
+        self.setWindowTitle("usphere DAQ Control")
+        self.resize(960, 720)
+        icon_path = Path(__file__).parent / "assets" / "uDAQ_logo.PNG"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        self._widget = DAQWidget(recorder=recorder, server=server)
+        self.setCentralWidget(self._widget)
+
+
 def main():
-    # Tell Windows this is its own app (not generic Python) so the taskbar
-    # shows our icon instead of the Python launcher icon.
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yale.usphere.DAQ")
@@ -828,9 +845,8 @@ def main():
     app.setStyle("Fusion")
     icon_path = Path(__file__).parent / "assets" / "uDAQ_logo.PNG"
     if icon_path.exists():
-        icon = QIcon(str(icon_path))
-        app.setWindowIcon(icon)
-    win = MainWindow()
+        app.setWindowIcon(QIcon(str(icon_path)))
+    win = DAQWindow()
     win.show()
     sys.exit(app.exec_())
 

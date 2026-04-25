@@ -167,6 +167,10 @@ class DAQRecorder:
         self._on_finished = on_finished
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # External metadata injected by the top-level coordinator or experiment
+        # scripts.  Merged into module_data at the start of every file.
+        self._injected: dict[str, dict] = {}
+        self._inject_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -184,6 +188,33 @@ class DAQRecorder:
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def inject_module_data(self, module_name: str, data: dict) -> None:
+        """
+        Queue external metadata to be written into every subsequent H5 file
+        as a module dataset named *module_name*.
+
+        Call this before starting recording, or between files in a multi-file
+        run.  The injected data persists across files until replaced or cleared.
+
+        Typical callers: usphere-EXPT coordinator scripts, ctrl_server (FPGA
+        snapshot, TIC readings), q_server (charge state).
+        """
+        with self._inject_lock:
+            self._injected[module_name] = dict(data)
+
+    def clear_injected(self, module_name: str | None = None) -> None:
+        """Remove one or all injected module datasets."""
+        with self._inject_lock:
+            if module_name is None:
+                self._injected.clear()
+            else:
+                self._injected.pop(module_name, None)
+
+    def list_injected(self) -> dict[str, list[str]]:
+        """Return {module_name: [key, ...]} for all currently injected datasets."""
+        with self._inject_lock:
+            return {k: list(v.keys()) for k, v in self._injected.items()}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -292,6 +323,11 @@ class DAQRecorder:
                 data[ch] = np.concatenate(buffers[ch])
 
         module_data = _collect_module_data(self._log, cfg.module_configs)
+        # Merge externally injected data (injected keys take precedence over
+        # same-named plugin keys so the coordinator can override stale defaults)
+        with self._inject_lock:
+            for mod_name, mod_vals in self._injected.items():
+                module_data.setdefault(mod_name, {}).update(mod_vals)
         self._write_h5(filepath, data, module_data)
         self._log(f"  -> Saved: {filepath}")
         if self._on_file_written:
