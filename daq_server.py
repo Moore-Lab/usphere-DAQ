@@ -42,6 +42,7 @@ Plugins:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import threading
@@ -88,6 +89,13 @@ class DAQServer(ModuleServer):
         self._last_file: str | None = None
         self._file_index: int = 0
         self._status_lock = threading.Lock()
+
+        # Optional background subscription to CTRL's PUB socket.
+        # When active, the latest FPGA registers and TIC readings are
+        # automatically injected into every H5 file without any experiment
+        # script needing to call inject_ctrl_state() explicitly.
+        self._ctrl_sub_running: bool = False
+        self._ctrl_sub_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # get_state — streamed by PUB loop
@@ -223,6 +231,71 @@ class DAQServer(ModuleServer):
 
     def _on_finished(self) -> None:
         log.info("Recording finished")
+
+    # ------------------------------------------------------------------
+    # CTRL subscription — automatic FPGA register + TIC injection
+    # ------------------------------------------------------------------
+
+    def start_ctrl_sub(self, host: str = "localhost", port: int = 5551) -> None:
+        """
+        Subscribe to CTRL's ZMQ PUB socket in a background thread.
+
+        Every state update from ctrl is unpacked and injected into the
+        active recorder as two module datasets:
+          "CTRL_FPGA" — flat dict of all FPGA register values
+          "CTRL_TIC"  — TIC pressure gauge readings
+
+        These persist across files in a multi-file recording run and are
+        overwritten each time a new state arrives (~5 Hz by default),
+        so each H5 file captures the most recent snapshot at write time.
+        """
+        if self._ctrl_sub_running:
+            return
+        self._ctrl_sub_running = True
+        self._ctrl_sub_thread = threading.Thread(
+            target=self._ctrl_sub_loop,
+            args=(host, port),
+            daemon=True,
+            name="daq-ctrl-sub",
+        )
+        self._ctrl_sub_thread.start()
+        log.info("Subscribed to CTRL PUB at %s:%d", host, port)
+
+    def stop_ctrl_sub(self) -> None:
+        self._ctrl_sub_running = False
+
+    def _ctrl_sub_loop(self, host: str, port: int) -> None:
+        import zmq
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.connect(f"tcp://{host}:{port}")
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        sock.setsockopt(zmq.RCVTIMEO, 300)
+        try:
+            while self._ctrl_sub_running and self._running:
+                try:
+                    msg = json.loads(sock.recv())
+                except zmq.Again:
+                    continue
+                except Exception:
+                    continue
+                # Skip event messages (sphere_caught etc.); only process state updates
+                if msg.get("module") == "ctrl" and "event" not in msg:
+                    self._on_ctrl_state(msg.get("data", {}))
+        finally:
+            sock.close()
+
+    def _on_ctrl_state(self, state: dict) -> None:
+        """Inject FPGA registers and TIC readings into the active recorder."""
+        regs = state.get("registers", {})
+        tic  = state.get("tic", {})
+        rec  = self._recorder
+        if rec is None:
+            return
+        if regs:
+            rec.inject_module_data("CTRL_FPGA", regs)
+        if tic:
+            rec.inject_module_data("CTRL_TIC", tic)
 
 
 # ---------------------------------------------------------------------------
