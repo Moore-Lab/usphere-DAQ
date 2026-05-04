@@ -620,6 +620,10 @@ class DAQWidget(QWidget):
         self._apply_config(cfg)
         self._modules_tab.set_all_configs(cfg.module_configs)
         self._update_derived()
+        # Sync server config immediately so ZMQ start_recording works without
+        # requiring the user to start a GUI recording first.
+        if self._server is not None:
+            self._server._config = cfg
 
     def _apply_config(self, cfg: DAQConfig):
         self._device_edit.setText(cfg.device)
