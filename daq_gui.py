@@ -592,6 +592,15 @@ class DAQWidget(QWidget):
         ctrl_row.addWidget(self._files_lbl)
         ctrl_row.addStretch()
 
+        self._fpga_ts_btn = QPushButton("Record FPGA buffer: OFF")
+        self._fpga_ts_btn.setCheckable(True)
+        self._fpga_ts_btn.setMinimumHeight(42)
+        self._fpga_ts_btn.setMinimumWidth(180)
+        self._fpga_ts_btn.setEnabled(self._server is not None)
+        self._apply_ts_btn_style(False)
+        self._fpga_ts_btn.toggled.connect(self._on_fpga_ts_toggled)
+        ctrl_row.addWidget(self._fpga_ts_btn)
+
         self._start_btn = QPushButton("Start Recording")
         self._start_btn.setMinimumHeight(42)
         self._start_btn.setMinimumWidth(210)
@@ -715,6 +724,29 @@ class DAQWidget(QWidget):
                 "QPushButton:hover { background-color: #28a745; }"
             )
 
+    def _apply_ts_btn_style(self, enabled: bool):
+        if enabled:
+            self._fpga_ts_btn.setText("Record FPGA buffer: ON")
+            self._fpga_ts_btn.setStyleSheet(
+                "QPushButton { background-color: #2980b9; color: white; "
+                "font-size: 12px; font-weight: bold; border-radius: 5px; }"
+                "QPushButton:hover { background-color: #3498db; }"
+            )
+        else:
+            self._fpga_ts_btn.setText("Record FPGA buffer: OFF")
+            self._fpga_ts_btn.setStyleSheet(
+                "QPushButton { font-size: 12px; border-radius: 5px; }"
+            )
+
+    def _on_fpga_ts_toggled(self, checked: bool):
+        if self._server is not None:
+            self._server._fpga_ts_enabled = checked
+            if checked:
+                with self._server._fpga_ts_lock:
+                    self._server._fpga_ts_samples.clear()
+                    self._server._tic_ts_samples.clear()
+        self._apply_ts_btn_style(checked)
+
     def _set_inputs_enabled(self, enabled: bool):
         for w in (
             self._device_edit, self._sr_edit, self._bits_spin,
@@ -738,6 +770,8 @@ class DAQWidget(QWidget):
     def _on_recording_finished(self):
         self._apply_btn_style(running=False)
         self._set_inputs_enabled(True)
+        if self._server is not None and self._server._recorder is self._recorder:
+            self._server._recorder = None
         self._recorder = None
 
     # ------------------------------------------------------------------
@@ -772,12 +806,22 @@ class DAQWidget(QWidget):
         )
 
         sig = self._signals
+
+        def _on_file(p: Path):
+            # Server side: flush time-series and update recorder ref tracking
+            if self._server is not None:
+                self._server._on_file_written(p)
+            sig.file_written.emit(str(p))
+
         self._recorder = DAQRecorder(
             config=cfg,
             on_status=lambda msg: sig.status_message.emit(msg),
-            on_file_written=lambda p: sig.file_written.emit(str(p)),
+            on_file_written=_on_file,
             on_finished=sig.finished.emit,
         )
+        # Give the server a reference so its ctrl-sub loop injects into this recorder
+        if self._server is not None:
+            self._server._recorder = self._recorder
         self._recorder.start()
         self._apply_btn_style(running=True)
         self._set_inputs_enabled(False)

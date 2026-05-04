@@ -222,6 +222,39 @@ def read_module(filepath: str | Path, module_name: str) -> dict:
                 for k, v in f[path].attrs.items()}
 
 
+def write_timeseries(
+    filepath: str | Path,
+    module_name: str,
+    samples: list[dict],
+) -> None:
+    """
+    Append time-series arrays to an existing H5 file.
+
+    *samples* is a list of dicts with the same keys (e.g. {"ts": t, "Dg X": v, ...}).
+    Each key becomes a 1-D float64 dataset under beads/data/<module_name>/<key>.
+    The group is (re)created on each call so the caller can safely call this
+    once per file without worrying about leftover data from a previous run.
+
+    Parameters
+    ----------
+    filepath    : path to an existing H5 file
+    module_name : dataset group name (e.g. "CTRL_FPGA_ts")
+    samples     : list of homogeneous dicts — all must share the same keys
+    """
+    if not samples:
+        return
+    keys = list(samples[0].keys())
+    arrays = {k: np.array([s.get(k, float("nan")) for s in samples], dtype=np.float64)
+              for k in keys}
+    group_path = f"beads/data/{module_name}"
+    with h5py.File(filepath, "a") as f:
+        if group_path in f:
+            del f[group_path]
+        grp = f.require_group(group_path)
+        for k, arr in arrays.items():
+            grp.create_dataset(k, data=arr, compression="gzip", compression_opts=1)
+
+
 def list_modules(filepath: str | Path) -> list[str]:
     """Return names of all module datasets present in the file."""
     with h5py.File(filepath, "r") as f:

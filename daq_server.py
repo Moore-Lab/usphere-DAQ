@@ -97,6 +97,14 @@ class DAQServer(ModuleServer):
         self._ctrl_sub_running: bool = False
         self._ctrl_sub_thread: threading.Thread | None = None
 
+        # Time-series recording: when enabled, each CTRL state update during a
+        # recording run is accumulated so every H5 file gets a full register
+        # time-series (not just the last snapshot).
+        self._fpga_ts_enabled: bool = False
+        self._fpga_ts_lock = threading.Lock()
+        self._fpga_ts_samples: list[dict] = []
+        self._tic_ts_samples: list[dict] = []
+
     # ------------------------------------------------------------------
     # get_state — streamed by PUB loop
     # ------------------------------------------------------------------
@@ -107,14 +115,15 @@ class DAQServer(ModuleServer):
             injected = (self._recorder.list_injected()
                         if self._recorder is not None else {})
         return {
-            "recording":    recording,
-            "file_index":   self._file_index,
-            "n_files":      self._config.n_files,
-            "output_dir":   self._config.output_dir,
-            "basename":     self._config.basename,
-            "sample_rate":  self._config.sample_rate,
-            "last_file":    self._last_file,
-            "injected":     list(injected.keys()),
+            "recording":       recording,
+            "file_index":      self._file_index,
+            "n_files":         self._config.n_files,
+            "output_dir":      self._config.output_dir,
+            "basename":        self._config.basename,
+            "sample_rate":     self._config.sample_rate,
+            "last_file":       self._last_file,
+            "injected":        list(injected.keys()),
+            "fpga_timeseries": self._fpga_ts_enabled,
         }
 
     # ------------------------------------------------------------------
@@ -179,6 +188,20 @@ class DAQServer(ModuleServer):
             names = [getattr(p, "MODULE_NAME", type(p).__name__) for p in get_plugins()]
             return {"status": "ok", "data": names}
 
+        # ---- FPGA time-series recording ----
+        if cmd == "enable_fpga_timeseries":
+            self._fpga_ts_enabled = True
+            with self._fpga_ts_lock:
+                self._fpga_ts_samples.clear()
+                self._tic_ts_samples.clear()
+            log.info("FPGA time-series recording enabled")
+            return {"status": "ok"}
+
+        if cmd == "disable_fpga_timeseries":
+            self._fpga_ts_enabled = False
+            log.info("FPGA time-series recording disabled")
+            return {"status": "ok"}
+
         return {"status": "error", "message": f"unknown command: {cmd!r}"}
 
     # ------------------------------------------------------------------
@@ -228,6 +251,25 @@ class DAQServer(ModuleServer):
         with self._status_lock:
             self._file_index += 1
         log.info("File written: %s", path)
+
+        if self._fpga_ts_enabled:
+            with self._fpga_ts_lock:
+                fpga_samples = list(self._fpga_ts_samples)
+                tic_samples  = list(self._tic_ts_samples)
+                self._fpga_ts_samples.clear()
+                self._tic_ts_samples.clear()
+            from daq_h5 import write_timeseries
+            if fpga_samples:
+                try:
+                    write_timeseries(path, "CTRL_FPGA_ts", fpga_samples)
+                    log.info("FPGA ts: wrote %d samples to %s", len(fpga_samples), path)
+                except Exception as exc:
+                    log.warning("FPGA ts write failed: %s", exc)
+            if tic_samples:
+                try:
+                    write_timeseries(path, "CTRL_TIC_ts", tic_samples)
+                except Exception as exc:
+                    log.warning("TIC ts write failed: %s", exc)
 
     def _on_finished(self) -> None:
         log.info("Recording finished")
@@ -296,6 +338,14 @@ class DAQServer(ModuleServer):
             rec.inject_module_data("CTRL_FPGA", regs)
         if tic:
             rec.inject_module_data("CTRL_TIC", tic)
+
+        if self._fpga_ts_enabled and rec.is_running():
+            ts = time.time()
+            with self._fpga_ts_lock:
+                if regs:
+                    self._fpga_ts_samples.append({"ts": ts, **regs})
+                if tic:
+                    self._tic_ts_samples.append({"ts": ts, **tic})
 
 
 # ---------------------------------------------------------------------------
