@@ -819,9 +819,11 @@ class DAQWidget(QWidget):
             on_file_written=_on_file,
             on_finished=sig.finished.emit,
         )
-        # Give the server a reference so its ctrl-sub loop injects into this recorder
+        # Give the server a reference so its ctrl-sub loop injects into this recorder,
+        # and sync its config so ZMQ start_recording uses the correct device/channels.
         if self._server is not None:
             self._server._recorder = self._recorder
+            self._server._config = cfg
         self._recorder.start()
         self._apply_btn_style(running=True)
         self._set_inputs_enabled(False)
