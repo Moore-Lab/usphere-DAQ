@@ -43,7 +43,7 @@ except ImportError:
 
 _PLUGIN_MODULES: list[str] = [
     "daq_fpga",
-    "daq_edwards_tic",
+    "daq_ctrl_tic",   # reads TIC pressures from CTRL via ZMQ (ctrl_server.py)
     # add future device modules here
 ]
 

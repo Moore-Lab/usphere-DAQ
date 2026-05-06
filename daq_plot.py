@@ -90,6 +90,7 @@ class PlotWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filepath: str | None = None
+        self._overlay_rows: dict[QWidget, QLineEdit] = {}
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -102,6 +103,7 @@ class PlotWidget(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         layout.addWidget(self._make_file_row())
+        layout.addWidget(self._make_overlay_panel())
         layout.addWidget(self._make_channel_panel())
         layout.addWidget(self._make_plot_area(), stretch=1)
 
@@ -140,6 +142,111 @@ class PlotWidget(QWidget):
         row.addWidget(self._live_btn)
 
         return box
+
+    # --- Overlay files ---
+
+    def _make_overlay_panel(self) -> QGroupBox:
+        self._overlay_box = QGroupBox("Overlay Files")
+        self._overlay_box.setCheckable(True)
+        self._overlay_box.setChecked(False)
+        vbox = QVBoxLayout(self._overlay_box)
+        vbox.setSpacing(4)
+        vbox.setContentsMargins(6, 4, 6, 4)
+
+        add_btn = QPushButton("+ Add file…")
+        add_btn.setMaximumWidth(110)
+        add_btn.clicked.connect(self._add_overlay_file)
+        vbox.addWidget(add_btn)
+
+        self._overlay_list_widget = QWidget()
+        self._overlay_list_layout = QVBoxLayout(self._overlay_list_widget)
+        self._overlay_list_layout.setSpacing(3)
+        self._overlay_list_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._overlay_scroll = QScrollArea()
+        self._overlay_scroll.setWidgetResizable(True)
+        self._overlay_scroll.setFrameShape(QScrollArea.NoFrame)
+        self._overlay_scroll.setMaximumHeight(110)
+        self._overlay_scroll.setWidget(self._overlay_list_widget)
+        vbox.addWidget(self._overlay_scroll)
+
+        return self._overlay_box
+
+    def _add_overlay_file(self, filepath: str = ""):
+        if not filepath:
+            start = str(Path(self._file_edit.text()).parent) if self._file_edit.text() else ""
+            filepath, _ = QFileDialog.getOpenFileName(
+                self, "Open HDF5 file for overlay", start,
+                "HDF5 files (*.h5 *.hdf5);;All files (*)",
+            )
+        if not filepath:
+            return
+
+        row_w = QWidget()
+        row_h = QHBoxLayout(row_w)
+        row_h.setContentsMargins(0, 0, 0, 0)
+        row_h.setSpacing(4)
+
+        edit = QLineEdit(filepath)
+        edit.setReadOnly(True)
+        row_h.addWidget(edit, stretch=1)
+
+        prev_btn = QPushButton("◄")
+        prev_btn.setFixedWidth(34)
+        prev_btn.setToolTip("Previous H5 file in directory")
+        prev_btn.clicked.connect(lambda: self._nav_overlay(row_w, -1))
+        row_h.addWidget(prev_btn)
+
+        next_btn = QPushButton("►")
+        next_btn.setFixedWidth(34)
+        next_btn.setToolTip("Next H5 file in directory")
+        next_btn.clicked.connect(lambda: self._nav_overlay(row_w, +1))
+        row_h.addWidget(next_btn)
+
+        rm_btn = QPushButton("✕")
+        rm_btn.setFixedWidth(34)
+        rm_btn.setToolTip("Remove this overlay")
+        rm_btn.clicked.connect(lambda: self._remove_overlay_row(row_w))
+        row_h.addWidget(rm_btn)
+
+        self._overlay_rows[row_w] = edit
+        self._overlay_list_layout.addWidget(row_w)
+
+    def _remove_overlay_row(self, row_w: QWidget):
+        self._overlay_rows.pop(row_w, None)
+        self._overlay_list_layout.removeWidget(row_w)
+        row_w.deleteLater()
+
+    def _nav_overlay(self, row_w: QWidget, direction: int):
+        edit = self._overlay_rows.get(row_w)
+        if edit is None:
+            return
+        current_path = edit.text()
+        if not current_path:
+            return
+        siblings = self._sibling_files_for(current_path)
+        if not siblings:
+            return
+        current = Path(current_path).resolve()
+        try:
+            idx = siblings.index(current)
+        except ValueError:
+            idx = 0
+        new_idx = idx + direction
+        if 0 <= new_idx < len(siblings):
+            edit.setText(str(siblings[new_idx]))
+
+    def _get_all_files(self) -> list[str]:
+        """Return primary file + all overlay files (if overlay box is checked)."""
+        files = []
+        if self._filepath:
+            files.append(self._filepath)
+        if self._overlay_box.isChecked():
+            for edit in self._overlay_rows.values():
+                p = edit.text().strip()
+                if p:
+                    files.append(p)
+        return files
 
     # --- Channel checkboxes + plot settings ---
 
@@ -363,21 +470,20 @@ class PlotWidget(QWidget):
     # File loading
     # ------------------------------------------------------------------
 
-    def _sibling_files(self) -> list[Path]:
-        """Return all .h5 files in the current file's directory, natural-sorted.
-
-        Natural sort treats embedded digit runs numerically, so
-        basename_9.h5 < basename_10.h5 < basename_39.h5 < basename_40.h5.
-        """
-        if not self._filepath:
-            return []
-        parent = Path(self._filepath).resolve().parent
+    def _sibling_files_for(self, filepath: str | Path) -> list[Path]:
+        """Natural-sorted .h5 siblings of filepath (including filepath itself)."""
+        parent = Path(filepath).resolve().parent
         files = sorted(
             parent.glob("*.h5"),
             key=lambda f: [int(c) if c.isdigit() else c.lower()
                            for c in re.split(r"(\d+)", f.name)],
         )
         return [f.resolve() for f in files]
+
+    def _sibling_files(self) -> list[Path]:
+        if not self._filepath:
+            return []
+        return self._sibling_files_for(self._filepath)
 
     def _nav_file(self, direction: int) -> None:
         """Step to the previous (direction=-1) or next (+1) H5 file and plot it."""
@@ -439,63 +545,64 @@ class PlotWidget(QWidget):
         if not selected:
             return
 
+        all_files = self._get_all_files()
+        multi_file = len(all_files) > 1
+
         self._time_ax.clear()
         self._psd_ax.clear()
 
         nperseg_bits = self._nperseg_spin.value()
-        logx  = self._logx_cb.isChecked()
-        logy  = self._logy_cb.isChecked()
-        use_asd     = self._spectrum_combo.currentIndex() == 0
-        use_filter  = self._bp_enable.isChecked()
-        fname = Path(self._filepath).name
+        logx       = self._logx_cb.isChecked()
+        logy       = self._logy_cb.isChecked()
+        use_asd    = self._spectrum_combo.currentIndex() == 0
+        use_filter = self._bp_enable.isChecked()
         sr_label = None
-        last_n = 0
+        last_n   = 0
 
-        for ch in selected:
-            try:
-                data, sr = load_channel(self._filepath, ch)
-            except Exception:
-                continue
-
-            if len(data) == 0:
-                continue
-
-            sr_label = sr
-            last_n   = len(data)
-
-            # Apply bandpass filter if enabled
-            if use_filter:
+        for filepath in all_files:
+            stem = Path(filepath).stem
+            for ch in selected:
                 try:
-                    data = self._apply_bandpass(data, sr)
-                except ValueError as exc:
-                    self._time_ax.set_title(f"Filter error: {exc}", fontsize=9, color="red")
-                    self._time_canvas.draw()
-                    return
+                    data, sr = load_channel(filepath, ch)
+                except Exception:
+                    continue
 
-            # Time domain
-            t = np.arange(len(data)) / sr
-            self._time_ax.plot(t, data, lw=0.6, label=ch, rasterized=True)
+                if len(data) == 0:
+                    continue
 
-            # Frequency domain
-            nperseg = min(2 ** nperseg_bits, len(data))
-            f, Pxx = welch(data, fs=sr, nperseg=nperseg)
+                sr_label = sr
+                last_n   = len(data)
+                label    = f"{stem}:{ch}" if multi_file else ch
 
-            # ASD = sqrt(PSD)
-            S = np.sqrt(Pxx) if use_asd else Pxx
+                if use_filter:
+                    try:
+                        data = self._apply_bandpass(data, sr)
+                    except ValueError as exc:
+                        self._time_ax.set_title(
+                            f"Filter error: {exc}", fontsize=9, color="red"
+                        )
+                        self._time_canvas.draw()
+                        return
 
-            f_plot = f[1:] if logx else f
-            S_plot = S[1:] if logx else S
+                t = np.arange(len(data)) / sr
+                self._time_ax.plot(t, data, lw=0.6, label=label, rasterized=True)
 
-            if logx and logy:
-                self._psd_ax.loglog(f_plot, S_plot, lw=0.8, label=ch)
-            elif logx:
-                self._psd_ax.semilogx(f_plot, S_plot, lw=0.8, label=ch)
-            elif logy:
-                self._psd_ax.semilogy(f_plot, S_plot, lw=0.8, label=ch)
-            else:
-                self._psd_ax.plot(f_plot, S_plot, lw=0.8, label=ch)
+                nperseg = min(2 ** nperseg_bits, len(data))
+                f, Pxx  = welch(data, fs=sr, nperseg=nperseg)
+                S       = np.sqrt(Pxx) if use_asd else Pxx
 
-        # Decorate time plot
+                f_plot = f[1:] if logx else f
+                S_plot = S[1:] if logx else S
+
+                if logx and logy:
+                    self._psd_ax.loglog(f_plot, S_plot, lw=0.8, label=label)
+                elif logx:
+                    self._psd_ax.semilogx(f_plot, S_plot, lw=0.8, label=label)
+                elif logy:
+                    self._psd_ax.semilogy(f_plot, S_plot, lw=0.8, label=label)
+                else:
+                    self._psd_ax.plot(f_plot, S_plot, lw=0.8, label=label)
+
         filter_note = ""
         if use_filter:
             try:
@@ -505,19 +612,21 @@ class PlotWidget(QWidget):
             except Exception:
                 pass
 
-        self._time_ax.set_xlabel("Time (s)")
-        self._time_ax.set_ylabel("Voltage (V)")
-        title = fname
+        show_legend = multi_file or len(selected) > 1
+
+        fname = Path(self._filepath).name
+        title = fname if not multi_file else f"{fname}  + {len(all_files) - 1} overlay(s)"
         if sr_label:
             title += f"   {sr_label:g} Hz   {fmt_duration(last_n / sr_label)}"
         if filter_note:
             title += filter_note
+        self._time_ax.set_xlabel("Time (s)")
+        self._time_ax.set_ylabel("Voltage (V)")
         self._time_ax.set_title(title, fontsize=9)
         self._time_ax.grid(True, alpha=0.3)
-        if len(selected) > 1:
+        if show_legend:
             self._time_ax.legend(fontsize=8, loc="best")
 
-        # Decorate frequency plot
         nperseg_actual = min(2 ** nperseg_bits, last_n) if sr_label else 2 ** nperseg_bits
         df = (sr_label / nperseg_actual) if sr_label else 0
         spectrum_label = "ASD" if use_asd else "PSD"
@@ -530,7 +639,7 @@ class PlotWidget(QWidget):
             fontsize=9,
         )
         self._psd_ax.grid(True, alpha=0.3, which="both")
-        if len(selected) > 1:
+        if show_legend:
             self._psd_ax.legend(fontsize=8, loc="best")
 
         self._time_canvas.draw()
