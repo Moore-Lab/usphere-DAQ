@@ -17,6 +17,7 @@ Standalone usage:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +119,18 @@ class PlotWidget(QWidget):
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_file)
         row.addWidget(browse_btn)
+
+        self._prev_btn = QPushButton("◄")
+        self._prev_btn.setFixedWidth(34)
+        self._prev_btn.setToolTip("Previous H5 file in directory")
+        self._prev_btn.clicked.connect(lambda: self._nav_file(-1))
+        row.addWidget(self._prev_btn)
+
+        self._next_btn = QPushButton("►")
+        self._next_btn.setFixedWidth(34)
+        self._next_btn.setToolTip("Next H5 file in directory")
+        self._next_btn.clicked.connect(lambda: self._nav_file(+1))
+        row.addWidget(self._next_btn)
 
         self._live_btn = QPushButton("Live Plot: OFF")
         self._live_btn.setCheckable(True)
@@ -349,6 +362,38 @@ class PlotWidget(QWidget):
     # ------------------------------------------------------------------
     # File loading
     # ------------------------------------------------------------------
+
+    def _sibling_files(self) -> list[Path]:
+        """Return all .h5 files in the current file's directory, natural-sorted.
+
+        Natural sort treats embedded digit runs numerically, so
+        basename_9.h5 < basename_10.h5 < basename_39.h5 < basename_40.h5.
+        """
+        if not self._filepath:
+            return []
+        parent = Path(self._filepath).resolve().parent
+        files = sorted(
+            parent.glob("*.h5"),
+            key=lambda f: [int(c) if c.isdigit() else c.lower()
+                           for c in re.split(r"(\d+)", f.name)],
+        )
+        return [f.resolve() for f in files]
+
+    def _nav_file(self, direction: int) -> None:
+        """Step to the previous (direction=-1) or next (+1) H5 file and plot it."""
+        siblings = self._sibling_files()
+        if not siblings:
+            return
+        current = Path(self._filepath).resolve() if self._filepath else None
+        try:
+            idx = siblings.index(current)
+        except ValueError:
+            idx = 0
+        new_idx = idx + direction
+        if 0 <= new_idx < len(siblings):
+            self.load_file(str(siblings[new_idx]))
+            if not self._live_btn.isChecked():
+                self._plot()
 
     def _browse_file(self):
         start = str(Path(self._file_edit.text()).parent) if self._file_edit.text() else ""
