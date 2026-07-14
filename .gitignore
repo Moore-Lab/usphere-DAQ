@@ -5,3 +5,7 @@
 
 # Analysis data (sensitive/unpublished)
 analysis/Inertial Sensing/
+
+# Runtime logs / state (auto-generated, not source)
+daq_session_log.jsonl
+*.log
