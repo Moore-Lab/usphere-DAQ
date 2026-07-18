@@ -44,6 +44,7 @@ except ImportError:
 _PLUGIN_MODULES: list[str] = [
     "daq_fpga",
     "daq_edwards_tic",
+    "daq_rp_feedback",
     # add future device modules here
 ]
 
